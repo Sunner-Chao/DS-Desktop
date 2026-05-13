@@ -371,6 +371,8 @@ function createPreviewBridge(): Window["deepseekDesktop"] {
       return { ...previewSettings };
     },
     getApiKey: async (provider = "deepseek") => previewApiKeys[provider] || "",
+    readImageDataUrl: async () => "",
+    readMediaDataUrl: async () => "",
     saveApiKey: async (payload) => {
       const provider = payload.provider === "nvidia-nim" ? "nvidia-nim" : "deepseek";
       const apiKey = String(payload.apiKey || "").trim();
@@ -734,6 +736,8 @@ function createTauriBridge(): Window["deepseekDesktop"] {
     getSettings: () => invoke<DesktopSettings>("get_settings"),
     saveSettings: (settings) => invoke<DesktopSettings>("save_settings", { settings }),
     getApiKey: (provider = "deepseek") => invoke<string>("get_api_key", { provider }),
+    readImageDataUrl: (path) => invoke<string>("read_image_data_url", { path }),
+    readMediaDataUrl: (path) => invoke<string>("read_media_data_url", { path }),
     saveApiKey: (payload) => invoke<{ ok: boolean; error?: string; hasKey?: boolean }>("save_api_key", { provider: payload.provider, apiKey: payload.apiKey }),
     getCustomization: (settings) => invoke<CustomizationDraft>("get_customization", { settings }),
     createSkillTemplate: (payload) => invoke<TemplateSaveResult>("create_skill_template", {
@@ -743,7 +747,7 @@ function createTauriBridge(): Window["deepseekDesktop"] {
       content: payload.content || ""
     }),
     importSkillDirectory: (payload) => invoke<SkillImportResult>("import_skill_directory", { sourcePath: payload.sourcePath }),
-    saveMcpConfig: (payload) => invoke<string>("save_mcp_config", { content: payload.content }),
+    saveMcpConfig: (payload) => invoke<McpConfigSaveResult>("save_mcp_config", { content: payload.content }),
     testMcpServers: (payload) => invoke<McpTestResult>("test_mcp_servers", { settings: payload.settings }),
     getConversationHistory: () => invoke<ConversationStore>("get_conversation_history"),
     saveConversationHistory: (history) => invoke<void>("save_conversation_history", { history }),

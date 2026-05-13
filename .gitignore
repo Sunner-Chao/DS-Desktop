@@ -7,6 +7,8 @@ release/
 coverage/
 .env
 .env.local
+.codex-run/
+.ds-code/
 build/certs/*.crt
 build/certs/*.key
 build/certs/*.pfx

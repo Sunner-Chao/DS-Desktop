@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import {
@@ -90,7 +91,14 @@ interface ChatMessage {
   role: "assistant" | "user";
   title?: string;
   content: string;
+  presentation?: "tool-progress";
+  toolKind?: ToolRequestKind;
+  imagePath?: string;
+  videoPath?: string;
+  toolTrace?: string;
 }
+
+type ToolRequestKind = "browser" | "filesystem" | "mcp";
 
 function buildConversationPrompt(history: ChatMessage[], prompt: string, language: AppLanguage, settings?: Settings) {
   const progressPattern = /^(正在请求|正在处理|Requesting|Processing)[。.]*$/i;
@@ -105,8 +113,8 @@ function buildConversationPrompt(history: ChatMessage[], prompt: string, languag
   const mcpHints: string[] = [];
   if (settings?.mcpEnabled && settings.enabledMcpServers.includes("playwright")) {
     mcpHints.push(language === "zh"
-      ? "如果用户要求网页截图、图片或浏览器操作，请直接使用 Playwright MCP 打开目标网址并截图。不要加载额外 skill，不要只写计划。截图必须保存到当前 workspace 的 `.ds-code/playwright-output` 目录；完成后立即回答保存后的文件路径。"
-      : "If the user asks for a webpage screenshot, image, or browser action, directly use Playwright MCP to open the target URL and capture it. Do not load extra skills and do not only write a plan. Save screenshots under `.ds-code/playwright-output` in the current workspace; then immediately answer with the saved file path.");
+      ? "如果用户要求网页截图、图片或浏览器操作，请直接使用 Playwright MCP 打开目标网址并截图。不要加载额外 skill，不要只写计划。必须尊重用户指定的保存位置，例如“桌面”就保存到系统桌面；如果用户没有指定位置，才保存到当前 workspace 的 `.ds-code/playwright-output` 目录。完成后立即回答保存后的文件路径。"
+      : "If the user asks for a webpage screenshot, image, or browser action, directly use Playwright MCP to open the target URL and capture it. Do not load extra skills and do not only write a plan. Respect the user's requested save location, such as the system Desktop when they ask for Desktop; only use `.ds-code/playwright-output` in the current workspace when no location is specified. Then immediately answer with the saved file path.");
   }
   const hintBlock = mcpHints.length ? `${mcpHints.join("\n")}\n\n` : "";
 
@@ -1411,6 +1419,60 @@ function createId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function messageContentSelector(id: string) {
+  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+    return `[data-message-content="${CSS.escape(id)}"]`;
+  }
+  return `[data-message-content="${id.replace(/"/g, '\\"')}"]`;
+}
+
+function hasMcpRuntime(settings: DesktopSettings) {
+  return settings.mcpEnabled && (
+    settings.enabledMcpServers.length > 0 ||
+    Boolean(settings.mcpConfigPath.trim())
+  );
+}
+
+function toolKindForPrompt(prompt: string): ToolRequestKind {
+  const lower = prompt.toLowerCase();
+  if (/(截图|截屏|网页|浏览器|打开网页|官网|图片|screenshot|browser|playwright|puppeteer|http:\/\/|https:\/\/|url|website|webpage)/i.test(lower)) {
+    return "browser";
+  }
+  if (/(文件|目录|读取|写入|保存|下载|路径|file|folder|directory|read|write|save|download|path)/i.test(lower)) {
+    return "filesystem";
+  }
+  return "mcp";
+}
+
+function shouldUseToolProgressMessage(prompt: string, settings: DesktopSettings, launchAction: LaunchAction) {
+  if (!hasMcpRuntime(settings)) return false;
+  if (launchAction === "plan") return false;
+  const normalized = prompt.trim().toLowerCase();
+  if (!normalized) return false;
+  return /(截图|截屏|截一张|浏览器|打开网页|官网|图片|网页|搜索|文件|目录|读取|写入|保存|下载|路径|mcp|工具|screenshot|browser|playwright|puppeteer|http:\/\/|https:\/\/|url|website|webpage|search|file|folder|directory|read|write|save|download|path|tool)/i.test(normalized);
+}
+
+function toolProgressCopy(language: AppLanguage, kind: ToolRequestKind) {
+  const zh = language === "zh";
+  const labels = {
+    browser: zh ? "浏览器工具" : "Browser tool",
+    filesystem: zh ? "文件工具" : "File tool",
+    mcp: zh ? "MCP 工具" : "MCP tool"
+  };
+  const stages = kind === "browser"
+    ? (zh ? ["连接 MCP", "启动浏览器", "执行操作", "整理结果"] : ["Connect MCP", "Start browser", "Run action", "Prepare result"])
+    : kind === "filesystem"
+      ? (zh ? ["连接 MCP", "检查路径", "执行读写", "整理结果"] : ["Connect MCP", "Check paths", "Run file task", "Prepare result"])
+      : (zh ? ["连接 MCP", "选择工具", "执行调用", "整理结果"] : ["Connect MCP", "Select tool", "Run call", "Prepare result"]);
+  return {
+    title: zh ? `${labels[kind]}正在执行` : `${labels[kind]} is running`,
+    subtitle: zh ? "下面会实时显示工具路由、模型规划和外部工具输出；不会展示隐藏推理。" : "Live tool routing, planning, and external tool output appear below. Hidden reasoning is not shown.",
+    previewLabel: zh ? "过程输出" : "Process output",
+    waiting: zh ? "正在启动工具链，等待第一条工具日志..." : "Starting the tool chain and waiting for the first tool log...",
+    stages
+  };
+}
+
 function defaultBaseUrlForProvider(provider: ProviderMode) {
   return provider === "nvidia-nim" ? NVIDIA_NIM_BASE_URL : DEEPSEEK_BASE_URL;
 }
@@ -1836,6 +1898,162 @@ function compactAgentReply(output: string, fallback: string) {
   return useful.length > 12000 ? `${useful.slice(0, 11997)}...` : useful;
 }
 
+function screenshotPathFromReply(content: string) {
+  const clean = stripAnsi(content);
+  const patterns = [
+    /截图已保存[:：]\s*([^\r\n]+?\.(?:png|jpe?g|webp|gif|bmp))/i,
+    /Screenshot written:\s*([^\r\n]+?\.(?:png|jpe?g|webp|gif|bmp))/i,
+    /文件已写入[:：]\s*([^\r\n]+?\.(?:png|jpe?g|webp|gif|bmp))/i
+  ];
+  for (const pattern of patterns) {
+    const match = clean.match(pattern);
+    if (match?.[1]) {
+      return match[1].trim().replace(/^["']|["']$/g, "");
+    }
+  }
+  return "";
+}
+
+function videoPathFromReply(content: string) {
+  const clean = stripAnsi(content);
+  const patterns = [
+    /视频已保存[:：]\s*([^\r\n]+?\.(?:webm|mp4|mov|mkv))/i,
+    /Video written:\s*([^\r\n]+?\.(?:webm|mp4|mov|mkv))/i,
+    /文件已写入[:：]\s*([^\r\n]+?\.(?:webm|mp4|mov|mkv))/i
+  ];
+  for (const pattern of patterns) {
+    const match = clean.match(pattern);
+    if (match?.[1]) {
+      return match[1].trim().replace(/^["']|["']$/g, "");
+    }
+  }
+  return "";
+}
+
+function toolTraceFromOutput(output: string) {
+  const clean = stripAnsi(output);
+  const lines = clean
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) =>
+      /^\[tool\]/i.test(line) ||
+      /^Opening /i.test(line) ||
+      /^Navigating /i.test(line) ||
+      /^Screenshot saved/i.test(line) ||
+      /^Video written/i.test(line) ||
+      /^截图/.test(line) ||
+      /^视频/.test(line)
+    );
+  const deduped: string[] = [];
+  for (const line of lines) {
+    if (deduped[deduped.length - 1] !== line) {
+      deduped.push(line);
+    }
+  }
+  return deduped.join("\n");
+}
+
+function messageTextWithoutToolNoise(content: string) {
+  const clean = stripAnsi(content);
+  return clean
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("[tool]"))
+    .join("\n")
+    .trim();
+}
+
+function pathLinesFromContent(content: string) {
+  return messageTextWithoutToolNoise(content)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /路径|文件夹|保存|written|saved|[A-Za-z]:\\/.test(line));
+}
+
+type ToolEventKind = "route" | "plan" | "browser" | "search" | "file" | "error" | "done" | "log";
+
+interface ToolEventItem {
+  id: string;
+  kind: ToolEventKind;
+  label: string;
+  detail: string;
+}
+
+function classifyToolEvent(line: string): ToolEventKind {
+  const lower = line.toLowerCase();
+  if (/失败|error|failed|timeout/.test(lower)) return "error";
+  if (/完成|已写入|截图已保存|视频已保存|saved|written/.test(lower)) return "done";
+  if (/mcp 路由|mcp servers|mcp config|cli/.test(lower)) return "route";
+  if (/计划|规划|plan|search_query|click_target/.test(lower)) return "plan";
+  if (/搜索|search|结果/.test(lower)) return "search";
+  if (/截图|视频|录制|输出位置|文件|desktop|path|folder/.test(lower)) return "file";
+  if (/chrome|playwright|browser|打开|页面|候选|点击|标签页|导航|record/.test(lower)) return "browser";
+  return "log";
+}
+
+function labelForToolEvent(kind: ToolEventKind, language: AppLanguage) {
+  const zh = language === "zh";
+  const labels: Record<ToolEventKind, string> = {
+    route: zh ? "路由" : "Route",
+    plan: zh ? "计划" : "Plan",
+    browser: zh ? "浏览器" : "Browser",
+    search: zh ? "搜索" : "Search",
+    file: zh ? "文件" : "File",
+    error: zh ? "错误" : "Error",
+    done: zh ? "完成" : "Done",
+    log: zh ? "日志" : "Log"
+  };
+  return labels[kind];
+}
+
+function toolEventsFromTrace(trace: string, language: AppLanguage): ToolEventItem[] {
+  return stripAnsi(trace)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line, index) => {
+      const clean = line.replace(/^\[tool\]\s*/i, "");
+      const kind = classifyToolEvent(clean);
+      return {
+        id: `${index}-${kind}`,
+        kind,
+        label: labelForToolEvent(kind, language),
+        detail: clean
+      };
+    });
+}
+
+function statusFromMessage(message: ChatMessage, language: AppLanguage) {
+  const text = `${message.content}\n${message.toolTrace || ""}`;
+  if (/失败|error|failed|timeout/i.test(text)) {
+    return language === "zh" ? "失败" : "Failed";
+  }
+  if (message.imagePath || message.videoPath || /截图已保存|视频已保存|已写入|完成|saved|written/i.test(text)) {
+    return language === "zh" ? "已完成" : "Completed";
+  }
+  if (message.presentation === "tool-progress") {
+    return language === "zh" ? "运行中" : "Running";
+  }
+  return language === "zh" ? "回答" : "Reply";
+}
+
+function runReplyMessage(id: string, capture: RunCapture, exit: { exitCode?: number; signal?: number; finalOutput?: string }, language: AppLanguage): ChatMessage {
+  const content = formatConciseRunReply(capture, exit, language);
+  const imagePath = screenshotPathFromReply(content);
+  const videoPath = videoPathFromReply(content);
+  const output = [capture.output, exit.finalOutput || ""]
+    .filter((part) => part.trim())
+    .join("\n");
+  return {
+    id,
+    role: "assistant",
+    content,
+    imagePath: imagePath || undefined,
+    videoPath: videoPath || undefined,
+    toolTrace: toolTraceFromOutput(output) || undefined
+  };
+}
+
 function formatConciseRunReply(capture: RunCapture, exit: { exitCode?: number; signal?: number; finalOutput?: string }, language: AppLanguage) {
   const copy = uiCopy[language].runSummary;
   const ok = !exit.signal && (exit.exitCode === 0 || typeof exit.exitCode === "undefined");
@@ -1894,6 +2112,173 @@ function iconForMcp(id: string) {
   return Plug;
 }
 
+function ToolProgressBubble({ message, language }: { message: ChatMessage; language: AppLanguage }) {
+  const kind = message.toolKind || "mcp";
+  const copy = toolProgressCopy(language, kind);
+  const Icon = kind === "browser" ? Globe2 : kind === "filesystem" ? FileCog : Plug;
+  const events = toolEventsFromTrace(message.content || "", language).slice(-20);
+  const preview = stripAnsi(message.content || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^(正在处理|processing|requesting|正在请求)[。.]*$/i.test(line))
+    .slice(-20)
+    .join("\n");
+
+  return (
+    <div className="tool-progress-card">
+      <div className="tool-progress-header">
+        <span className={`tool-progress-icon ${kind}`}>
+          <Icon size={18} aria-hidden />
+        </span>
+        <div>
+          <strong>{message.title || copy.title}</strong>
+          <p>{copy.subtitle}</p>
+        </div>
+      </div>
+      <div className="tool-progress-preview">
+        <span>{events.length ? copy.previewLabel : copy.waiting}</span>
+        {events.length ? <ToolTimeline events={events} compact /> : preview ? <code>{preview}</code> : null}
+      </div>
+    </div>
+  );
+}
+
+function MessageImage({ path, desktop }: { path: string; desktop: Window["deepseekDesktop"] }) {
+  const fallbackSrc = useMemo(() => convertFileSrc(path), [path]);
+  const [src, setSrc] = useState(fallbackSrc);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSrc(fallbackSrc);
+    setFailed(false);
+    desktop.readImageDataUrl(path)
+      .then((dataUrl) => {
+        if (!cancelled && dataUrl) {
+          setSrc(dataUrl);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [desktop, fallbackSrc, path]);
+
+  return (
+    <a className="message-image-link" href={src} target="_blank" rel="noreferrer" title={path}>
+      {failed ? (
+        <span className="message-image-fallback">{path}</span>
+      ) : (
+        <img className="message-image" src={src} alt="screenshot" onError={() => setFailed(true)} />
+      )}
+    </a>
+  );
+}
+
+function MessageVideo({ path, desktop }: { path: string; desktop: Window["deepseekDesktop"] }) {
+  const fallbackSrc = useMemo(() => convertFileSrc(path), [path]);
+  const [src, setSrc] = useState(fallbackSrc);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSrc(fallbackSrc);
+    setFailed(false);
+    desktop.readMediaDataUrl(path)
+      .then((dataUrl) => {
+        if (!cancelled && dataUrl) {
+          setSrc(dataUrl);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [desktop, fallbackSrc, path]);
+
+  return (
+    <a className="message-video-link" href={src} target="_blank" rel="noreferrer" title={path}>
+      {failed ? (
+        <span className="message-image-fallback">{path}</span>
+      ) : (
+        <video className="message-video" src={src} controls onError={() => setFailed(true)} />
+      )}
+    </a>
+  );
+}
+
+function ToolTimeline({ events, compact = false }: { events: ToolEventItem[]; compact?: boolean }) {
+  return (
+    <ol className={compact ? "tool-timeline compact" : "tool-timeline"}>
+      {events.map((event) => (
+        <li key={event.id} className={`tool-event ${event.kind}`}>
+          <span className="tool-event-dot" aria-hidden />
+          <b>{event.label}</b>
+          <span>{event.detail}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function ToolTraceDetails({ trace, language }: { trace: string; language: AppLanguage }) {
+  const events = toolEventsFromTrace(trace, language);
+  const label = language === "zh" ? `工具执行步骤 (${events.length})` : `Tool execution steps (${events.length})`;
+  return (
+    <details className="message-tool-trace" open>
+      <summary>{label}</summary>
+      <ToolTimeline events={events} />
+    </details>
+  );
+}
+
+function AssistantMessageBody({ message, language, desktop }: { message: ChatMessage; language: AppLanguage; desktop: Window["deepseekDesktop"] }) {
+  const status = statusFromMessage(message, language);
+  const body = messageTextWithoutToolNoise(message.content);
+  const paths = pathLinesFromContent(message.content);
+  const hasStructured = Boolean(message.imagePath || message.videoPath || message.toolTrace || paths.length);
+
+  if (!hasStructured) {
+    return (
+      <>
+        {message.title ? <strong>{message.title}</strong> : null}
+        <p data-message-content={message.id}>{message.content}</p>
+      </>
+    );
+  }
+
+  return (
+    <div className="assistant-result-card">
+      <div className="assistant-result-header">
+        <span className={`assistant-status ${status === "失败" || status === "Failed" ? "failed" : "ok"}`}>{status}</span>
+        <strong>{message.title || (language === "zh" ? "任务结果" : "Task result")}</strong>
+      </div>
+      {body ? <p className="assistant-result-text" data-message-content={message.id}>{body}</p> : null}
+      {message.imagePath ? (
+        <section className="assistant-section">
+          <span className="assistant-section-title">{language === "zh" ? "截图预览" : "Screenshot"}</span>
+          <MessageImage path={message.imagePath} desktop={desktop} />
+        </section>
+      ) : null}
+      {message.videoPath ? (
+        <section className="assistant-section">
+          <span className="assistant-section-title">{language === "zh" ? "视频预览" : "Video"}</span>
+          <MessageVideo path={message.videoPath} desktop={desktop} />
+        </section>
+      ) : null}
+      {paths.length ? (
+        <section className="assistant-path-list">
+          {paths.map((line) => (
+            <code key={line}>{line}</code>
+          ))}
+        </section>
+      ) : null}
+      {message.toolTrace ? <ToolTraceDetails trace={message.toolTrace} language={language} /> : null}
+    </div>
+  );
+}
+
 function App() {
   const [settings, setSettings] = useState<DesktopSettings>(defaultSettings);
   const [runtime, setRuntime] = useState<RuntimeCheck | null>(null);
@@ -1950,6 +2335,10 @@ function App() {
   const terminalOutputBySessionRef = useRef<Record<string, string>>({});
   const runCaptureRef = useRef<RunCapture | null>(null);
   const runFinalizeTimerRef = useRef<number | null>(null);
+  const streamFlushFrameRef = useRef<number | null>(null);
+  const pendingStreamSessionRef = useRef("");
+  const pendingStreamMessageIdRef = useRef("");
+  const toolProgressMessageIdsRef = useRef<Set<string>>(new Set());
   const desktop = useMemo(() => getDesktopBridge(), []);
   const language = settings.language;
   const t = uiCopy[language];
@@ -2274,25 +2663,86 @@ function App() {
   }, [fitTerminal, mainView]);
 
   useEffect(() => {
+    const flushStreamingMessage = () => {
+      streamFlushFrameRef.current = null;
+      const capture = runCaptureRef.current;
+      const replyMessageId = pendingStreamMessageIdRef.current;
+      if (!capture || !replyMessageId) return;
+      const content = compactAgentReply(capture.output, language === "zh" ? "正在处理。" : "Processing.");
+      const isToolProgress = toolProgressMessageIdsRef.current.has(replyMessageId);
+      if (!isToolProgress) {
+        const contentNode = document.querySelector<HTMLElement>(messageContentSelector(replyMessageId));
+        if (contentNode && contentNode.textContent !== content) {
+          contentNode.textContent = content;
+        }
+      }
+      const streamingMessage: ChatMessage = {
+        id: replyMessageId,
+        role: "assistant",
+        content
+      };
+      setMessages((current) => current.map((candidate) =>
+        candidate.id === replyMessageId
+          ? isToolProgress
+            ? { ...candidate, content }
+            : streamingMessage
+          : candidate
+      ));
+    };
+
+    const scheduleStreamingMessageFlush = (capture: RunCapture) => {
+      if (!capture.replyMessageId) return;
+      pendingStreamSessionRef.current = capture.sessionId;
+      pendingStreamMessageIdRef.current = capture.replyMessageId;
+      if (streamFlushFrameRef.current !== null) return;
+      streamFlushFrameRef.current = window.requestAnimationFrame(flushStreamingMessage);
+    };
+
+    const applyStreamChunk = (data: string) => {
+      const capture = runCaptureRef.current;
+      const terminalSessionId = capture?.sessionId || terminalRunSessionIdRef.current || activeSessionIdRef.current;
+      if (terminalSessionId) {
+        terminalOutputBySessionRef.current[terminalSessionId] = appendTerminalCapture(
+          terminalOutputBySessionRef.current[terminalSessionId] || "",
+          data
+        );
+      }
+      if (capture) {
+        capture.output = appendTerminalCapture(capture.output, data);
+        if (capture.replyMessageId) {
+          scheduleStreamingMessageFlush(capture);
+        }
+      }
+      if (!terminalSessionId || activeSessionIdRef.current === terminalSessionId) {
+        terminalRef.current?.write(data);
+      }
+    };
+
+    window.__deepseekDesktopStreamPush = (_sessionId: string, data: string) => {
+      applyStreamChunk(data || "");
+    };
+
     const finalizeRunCapture = (exit: { exitCode?: number; signal?: number; finalOutput?: string }) => {
       if (runFinalizeTimerRef.current !== null) {
         window.clearTimeout(runFinalizeTimerRef.current);
         runFinalizeTimerRef.current = null;
       }
+      if (streamFlushFrameRef.current !== null) {
+        window.cancelAnimationFrame(streamFlushFrameRef.current);
+        streamFlushFrameRef.current = null;
+      }
+      pendingStreamSessionRef.current = "";
+      pendingStreamMessageIdRef.current = "";
       setRunning(false);
       setStatus({ type: "exited", exitCode: exit.exitCode });
       terminalRunSessionIdRef.current = "";
       const capture = runCaptureRef.current;
       runCaptureRef.current = null;
       if (capture) {
-        if (exit.finalOutput) {
-          capture.output = exit.finalOutput;
+        if (capture.replyMessageId) {
+          toolProgressMessageIdsRef.current.delete(capture.replyMessageId);
         }
-        const message: ChatMessage = {
-          id: capture.replyMessageId || createId(),
-          role: "assistant",
-          content: formatConciseRunReply(capture, exit, language)
-        };
+        const message = runReplyMessage(capture.replyMessageId || createId(), capture, exit, language);
         if (capture.sessionId) {
           commitConversationStore((current) => updateConversationSession(current, capture.sessionId, language, (session) => ({
             ...session,
@@ -2308,39 +2758,7 @@ function App() {
       }
     };
     const offData = desktop.onTerminalData((data) => {
-      const capture = runCaptureRef.current;
-      const terminalSessionId = capture?.sessionId || terminalRunSessionIdRef.current || activeSessionIdRef.current;
-      if (terminalSessionId) {
-        terminalOutputBySessionRef.current[terminalSessionId] = appendTerminalCapture(
-          terminalOutputBySessionRef.current[terminalSessionId] || "",
-          data
-        );
-      }
-      if (capture) {
-        capture.output = appendTerminalCapture(capture.output, data);
-        if (capture.replyMessageId) {
-          const streamingMessage: ChatMessage = {
-            id: capture.replyMessageId,
-            role: "assistant",
-            content: compactAgentReply(capture.output, language === "zh" ? "正在处理。" : "Processing.")
-          };
-          setMessages((current) => current.map((candidate) =>
-            candidate.id === capture.replyMessageId ? streamingMessage : candidate
-          ));
-          if (capture.sessionId) {
-            commitConversationStore((current) => updateConversationSession(current, capture.sessionId, language, (session) => ({
-              ...session,
-              updatedAt: new Date().toISOString(),
-              messages: session.messages.map((candidate) =>
-                candidate.id === capture.replyMessageId ? streamingMessage : candidate
-              )
-            })));
-          }
-        }
-      }
-      if (!terminalSessionId || activeSessionIdRef.current === terminalSessionId) {
-        terminalRef.current?.write(data);
-      }
+      applyStreamChunk(data);
     });
     const offExit = desktop.onTerminalExit((exit) => {
       window.setTimeout(() => finalizeRunCapture(exit), 250);
@@ -2350,6 +2768,11 @@ function App() {
         window.clearTimeout(runFinalizeTimerRef.current);
         runFinalizeTimerRef.current = null;
       }
+      if (streamFlushFrameRef.current !== null) {
+        window.cancelAnimationFrame(streamFlushFrameRef.current);
+        streamFlushFrameRef.current = null;
+      }
+      delete window.__deepseekDesktopStreamPush;
       offData();
       offExit();
     };
@@ -2675,6 +3098,9 @@ function App() {
     if (launchApiKey) {
       const keyResult = await desktop.saveApiKey({ provider: nextSettings.provider, apiKey: launchApiKey });
       if (!keyResult.ok) {
+        if (replyMessageId) {
+          toolProgressMessageIdsRef.current.delete(replyMessageId);
+        }
         runCaptureRef.current = null;
         terminalRunSessionIdRef.current = "";
         setStatus({ type: "error", message: keyResult.error || t.settings.apiKeySaveFailed });
@@ -2693,6 +3119,9 @@ function App() {
       });
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error || t.status.launchFailed);
+      if (replyMessageId) {
+        toolProgressMessageIdsRef.current.delete(replyMessageId);
+      }
       runCaptureRef.current = null;
       terminalRunSessionIdRef.current = "";
       setRunning(false);
@@ -2711,6 +3140,9 @@ function App() {
       return;
     }
     if (!result.ok) {
+      if (replyMessageId) {
+        toolProgressMessageIdsRef.current.delete(replyMessageId);
+      }
       runCaptureRef.current = null;
       terminalRunSessionIdRef.current = "";
       if (replyMessageId) {
@@ -2736,13 +3168,14 @@ function App() {
         startedAt: new Date().toISOString(),
         output: ""
       };
-      capture.output = result.finalOutput;
+      capture.output = capture.output
+        ? `${capture.output}\n${result.finalOutput}`
+        : result.finalOutput;
       const exit = { exitCode: result.exitCode ?? 0, finalOutput: result.finalOutput };
-      const message: ChatMessage = {
-        id: replyMessageId || createId(),
-        role: "assistant",
-        content: formatConciseRunReply(capture, exit, language)
-      };
+      const message = runReplyMessage(replyMessageId || createId(), capture, exit, language);
+      if (replyMessageId) {
+        toolProgressMessageIdsRef.current.delete(replyMessageId);
+      }
       runCaptureRef.current = null;
       terminalRunSessionIdRef.current = "";
       setRunning(false);
@@ -2781,11 +3214,10 @@ function App() {
               runFinalizeTimerRef.current = null;
             }
             const exit = { exitCode: completed.exitCode, finalOutput: completed.finalOutput };
-            const message: ChatMessage = {
-              id: capture.replyMessageId || createId(),
-              role: "assistant",
-              content: formatConciseRunReply(capture, exit, language)
-            };
+            const message = runReplyMessage(capture.replyMessageId || createId(), capture, exit, language);
+            if (capture.replyMessageId) {
+              toolProgressMessageIdsRef.current.delete(capture.replyMessageId);
+            }
             terminalRunSessionIdRef.current = "";
             setRunning(false);
             setStatus({ type: "exited", exitCode: completed.exitCode });
@@ -2982,13 +3414,21 @@ function App() {
     const prompt = agentPrompt.trim();
     if (!prompt) return;
 
+    const launchAction: LaunchAction = agentMode === "plan" ? "plan" : agentMode === "yolo" ? "yolo" : "exec";
+    const useToolProgress = shouldUseToolProgressMessage(prompt, settings, launchAction);
+    const toolKind = useToolProgress ? toolKindForPrompt(prompt) : undefined;
+    const toolCopy = toolKind ? toolProgressCopy(language, toolKind) : null;
     const assistantContent = agentMode === "plan"
       ? t.promptResult.planContent
       : agentMode === "yolo"
         ? t.promptResult.yoloContent
-        : t.promptResult.execContent;
-    const launchAction: LaunchAction = agentMode === "plan" ? "plan" : agentMode === "yolo" ? "yolo" : "exec";
+        : useToolProgress
+          ? (language === "zh" ? "正在连接 MCP 工具..." : "Connecting MCP tool...")
+          : t.promptResult.execContent;
     const replyMessageId = createId();
+    if (useToolProgress) {
+      toolProgressMessageIdsRef.current.add(replyMessageId);
+    }
 
     const nextMessages: ChatMessage[] = [
       ...messages,
@@ -2996,6 +3436,9 @@ function App() {
       {
         id: replyMessageId,
         role: "assistant",
+        title: toolCopy?.title,
+        presentation: useToolProgress ? "tool-progress" : undefined,
+        toolKind,
         content: assistantContent
       }
     ];
@@ -4032,9 +4475,12 @@ function App() {
                   <div className="message-avatar">
                     {message.role === "assistant" ? <Bot size={16} aria-hidden /> : <Code2 size={16} aria-hidden />}
                   </div>
-                  <div className="message-bubble">
-                    {message.title ? <strong>{message.title}</strong> : null}
-                    <p>{message.content}</p>
+                  <div className={`message-bubble ${message.presentation === "tool-progress" ? "tool-progress-bubble" : ""}`}>
+                    {message.presentation === "tool-progress" ? (
+                      <ToolProgressBubble message={message} language={language} />
+                    ) : (
+                      <AssistantMessageBody message={message} language={language} desktop={desktop} />
+                    )}
                   </div>
                 </article>
               )) : null}

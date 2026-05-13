@@ -1,17 +1,18 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
+use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use dirs::home_dir;
 use once_cell::sync::Lazy;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tracing::{error, info};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -151,6 +152,9 @@ impl TerminalSession {
 }
 
 fn get_user_data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("DS_CODE_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ds-code")
@@ -170,6 +174,13 @@ fn get_skills_dir() -> PathBuf {
 
 fn get_log_dir() -> PathBuf {
     get_user_data_dir().join("logs")
+}
+
+fn configured_screenshot_dir() -> Option<PathBuf> {
+    std::env::var_os("DS_CODE_SCREENSHOT_DIR")
+        .or_else(|| std::env::var_os("DS_CODE_PLAYWRIGHT_OUTPUT_DIR"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
 }
 
 fn ensure_user_data_dir() -> std::io::Result<()> {
@@ -200,6 +211,67 @@ fn save_settings(settings: Settings) -> Result<Settings, String> {
     fs::write(&path, content).map_err(|e| e.to_string())?;
     info!("Settings saved");
     Ok(settings)
+}
+
+#[tauri::command]
+fn read_image_data_url(path: String) -> Result<String, String> {
+    let image_path = PathBuf::from(path.trim());
+    if !image_path.exists() {
+        return Err("Image file does not exist".to_string());
+    }
+    let extension = image_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match extension.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        _ => "image/png",
+    };
+    let bytes = fs::read(&image_path).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "data:{};base64,{}",
+        mime,
+        general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+#[tauri::command]
+fn read_media_data_url(path: String) -> Result<String, String> {
+    let media_path = PathBuf::from(path.trim());
+    if !media_path.exists() {
+        return Err("Media file does not exist".to_string());
+    }
+    let bytes = fs::read(&media_path).map_err(|e| e.to_string())?;
+    let max_bytes = std::env::var("DS_CODE_MEDIA_PREVIEW_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64 * 1024 * 1024);
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "Media file is too large for inline preview: {} bytes",
+            bytes.len()
+        ));
+    }
+    let extension = media_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match extension.as_str() {
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        _ => "video/webm",
+    };
+    Ok(format!(
+        "data:{};base64,{}",
+        mime,
+        general_purpose::STANDARD.encode(bytes)
+    ))
 }
 
 // API Key commands
@@ -519,6 +591,30 @@ pub struct TerminalStartResult {
     pub exit_code: Option<i32>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct BrowserToolPlan {
+    #[serde(default)]
+    start_url: String,
+    #[serde(default)]
+    search_query: String,
+    #[serde(default)]
+    click_target: String,
+    #[serde(default)]
+    screenshot: bool,
+    #[serde(default)]
+    record_seconds: u64,
+    #[serde(default)]
+    login_required: bool,
+    #[serde(default)]
+    fullscreen: bool,
+    #[serde(default)]
+    wait_for_user_seconds: u64,
+    #[serde(default)]
+    action_plan: Vec<String>,
+    #[serde(default)]
+    save_location: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalCompletedResult {
     #[serde(rename = "sessionId")]
@@ -530,7 +626,6 @@ pub struct TerminalCompletedResult {
 }
 
 fn get_bundled_binary_path() -> String {
-    // Get the path to the bundled deepseek binary from node_modules/deepseek-tui/bin/downloads
     if let Ok(cargo_manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
         let deepseek_binary = PathBuf::from(cargo_manifest_dir)
             .parent() // src-tauri
@@ -548,16 +643,23 @@ fn get_bundled_binary_path() -> String {
             }
         }
     }
-    // Fallback: try common locations
-    let common_paths = [
-        "D:\\pro_sunner\\demo_vscode\\DeepseekCode\\node_modules\\deepseek-tui\\bin\\downloads\\deepseek.exe",
-    ];
-    for path in &common_paths {
-        if PathBuf::from(path).exists() {
-            return path.to_string();
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            let candidate = ancestor
+                .join("node_modules")
+                .join("deepseek-tui")
+                .join("bin")
+                .join("downloads")
+                .join(if cfg!(target_os = "windows") {
+                    "deepseek.exe"
+                } else {
+                    "deepseek"
+                });
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
         }
     }
-    // Last fallback: just "deepseek" in PATH
     "deepseek".to_string()
 }
 
@@ -580,11 +682,194 @@ fn language_instruction(language: &str) -> &'static str {
     }
 }
 
+fn default_skill_content(id: &str) -> Option<&'static str> {
+    match id {
+        "superpowers" => Some(
+            "# Superpowers\n\nUse this skill to strengthen planning, task decomposition, code editing, verification, and final reporting.\n\n- Start by identifying the user's concrete goal and the workspace scope.\n- Prefer small, reversible edits that match the existing codebase.\n- Verify changes with the narrowest useful command before reporting completion.\n- Surface blockers, assumptions, and residual risk clearly.\n",
+        ),
+        "ui-ux-design" => Some(
+            "# UI/UX Design\n\nUse this skill for product UI work, desktop app polish, and visual interaction checks.\n\n- Keep primary workflows visible and reduce default configuration clutter.\n- Use familiar controls: icon buttons for tools, toggles for binary settings, and compact panels for advanced options.\n- Check spacing, overflow, text fit, empty states, disabled states, and responsive constraints.\n- Prefer restrained, work-focused surfaces for developer tools.\n",
+        ),
+        "cron-scheduler" => Some(
+            "---\nname: cron-scheduler\ndescription: Advanced-only helper for hand-authored crontab files. Normal scheduled tasks are managed by the Scheduled Tasks screen.\n---\n\n# Cron Advanced Scripts\n\nUse this skill only when the user explicitly asks for a raw cron file or crontab snippet. For normal recurring Agent tasks, use the desktop Scheduled Tasks screen.\n\n- Treat this as an advanced escape hatch, not the default scheduled-task workflow.\n- Generate and validate a cron file before discussing installation.\n- Do not run `crontab`, overwrite an existing crontab, or install a task unless the user explicitly asks.\n- Prefer outputs under `.deepseek/cron/` and logs under `.deepseek/logs/`.\n",
+        ),
+        "skill-downloader" => Some(
+            "---\nname: skill-downloader\ndescription: Use when the user asks to download, install, import, fetch, or update a Skill from a URL, GitHub raw file, local path, or archive.\n---\n\n# Skill Downloader\n\nUse this skill when a user asks to download or install a Skill during a desktop Agent conversation.\n\n- Do not synthesize remote Skill content. Download or copy the source bytes first, then verify the saved file.\n- Prefer `curl -fsSL \"<skill-url>\" -o \".deepseek/skills/<skill-id>/SKILL.md\"` for URL sources.\n- Verify with a non-empty file check and inspect the first lines for `name:` and `description:` frontmatter.\n- Report the source URL, destination path, and verification result.\n",
+        ),
+        _ => None,
+    }
+}
+
+fn default_skill_ids() -> [&'static str; 4] {
+    [
+        "superpowers",
+        "ui-ux-design",
+        "cron-scheduler",
+        "skill-downloader",
+    ]
+}
+
+fn sanitize_id(value: &str, fallback: &str) -> String {
+    let id = value
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if id.is_empty() {
+        fallback.to_string()
+    } else {
+        id
+    }
+}
+
+fn frontmatter_value(content: &str, key: &str) -> String {
+    if !content.starts_with("---") {
+        return String::new();
+    }
+    let Some(rest) = content.strip_prefix("---") else {
+        return String::new();
+    };
+    let Some((frontmatter, _)) = rest.split_once("---") else {
+        return String::new();
+    };
+    let prefix = format!("{}:", key);
+    frontmatter
+        .lines()
+        .map(str::trim)
+        .find_map(|line| {
+            line.strip_prefix(&prefix)
+                .map(|value| value.trim().trim_matches('"').to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn skill_name_from_content(id: &str, content: &str) -> String {
+    let fm_name = frontmatter_value(content, "name");
+    if !fm_name.is_empty() {
+        return fm_name;
+    }
+    content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("# ").map(str::trim))
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn skill_description_from_content(content: &str) -> String {
+    let description = frontmatter_value(content, "description");
+    if !description.is_empty() {
+        return description;
+    }
+    "Custom agent workflow skill.".to_string()
+}
+
+fn skill_from_file(id: String, path: PathBuf, source: &str, origin: &str) -> Option<SkillTemplate> {
+    let content = fs::read_to_string(&path).ok()?;
+    Some(SkillTemplate {
+        id: id.clone(),
+        name: skill_name_from_content(&id, &content),
+        description: skill_description_from_content(&content),
+        source: source.to_string(),
+        origin: origin.to_string(),
+        path: path.to_string_lossy().to_string(),
+        content,
+    })
+}
+
+fn ensure_default_skills(skill_root: &Path) -> Result<(), String> {
+    fs::create_dir_all(skill_root).map_err(|e| e.to_string())?;
+    for id in default_skill_ids() {
+        let Some(content) = default_skill_content(id) else {
+            continue;
+        };
+        let skill_dir = skill_root.join(id);
+        let skill_file = skill_dir.join("SKILL.md");
+        if !skill_file.exists() {
+            fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
+            fs::write(skill_file, content).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn load_skill_templates(skill_root: &Path) -> Result<HashMap<String, SkillTemplate>, String> {
+    ensure_default_skills(skill_root)?;
+    let mut templates = HashMap::new();
+    let entries = fs::read_dir(skill_root).map_err(|e| e.to_string())?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let skill_file = path.join("SKILL.md");
+        if !skill_file.exists() {
+            continue;
+        }
+        let id = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let origin = if default_skill_ids().contains(&id.as_str()) {
+            "preset"
+        } else {
+            "custom"
+        };
+        if let Some(skill) = skill_from_file(id.clone(), skill_file, "file", origin) {
+            templates.insert(id, skill);
+        }
+    }
+    Ok(templates)
+}
+
+fn build_skill_prompt_prefix(settings: &Settings) -> String {
+    if !settings.skills_enabled {
+        return String::new();
+    }
+    let skill_root = if settings.skills_dir.trim().is_empty() {
+        get_skills_dir()
+    } else {
+        PathBuf::from(settings.skills_dir.trim())
+    };
+    let Ok(templates) = load_skill_templates(&skill_root) else {
+        return String::new();
+    };
+    let enabled = if settings.enabled_skills.is_empty() {
+        default_skill_ids()
+            .iter()
+            .map(|id| id.to_string())
+            .collect()
+    } else {
+        settings.enabled_skills.clone()
+    };
+    let mut blocks = Vec::new();
+    for id in enabled {
+        if let Some(skill) = templates.get(&id) {
+            blocks.push(format!("## {}\n{}", skill.name, skill.content.trim()));
+        }
+    }
+    if blocks.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "已启用以下 Skills。回答和执行任务时必须按这些指令工作；只有当用户请求明显不相关时才忽略。\n\n{}\n\n---\n\n",
+            blocks.join("\n\n")
+        )
+    }
+}
+
 fn mcp_preset_server(id: &str, workspace_dir: &PathBuf) -> Option<Value> {
     let workspace = workspace_dir.to_string_lossy().to_string();
-    let playwright_output_dir = workspace_dir
-        .join(".ds-code")
-        .join("playwright-output")
+    let playwright_output_dir = configured_screenshot_dir()
+        .unwrap_or_else(|| workspace_dir.join(".ds-code").join("playwright-output"))
         .to_string_lossy()
         .to_string();
     match id {
@@ -655,7 +940,9 @@ fn ensure_mcp_config(
         return Ok(None);
     }
     ensure_user_data_dir().map_err(|e| e.to_string())?;
-    let _ = fs::create_dir_all(workspace_dir.join(".ds-code").join("playwright-output"));
+    let default_output_dir = configured_screenshot_dir()
+        .unwrap_or_else(|| workspace_dir.join(".ds-code").join("playwright-output"));
+    let _ = fs::create_dir_all(default_output_dir);
     let path = get_user_data_dir().join("mcp.presets.json");
     let config = serde_json::json!({
         "timeouts": {
@@ -670,17 +957,181 @@ fn ensure_mcp_config(
     Ok(Some(path.to_string_lossy().to_string()))
 }
 
+fn generated_mcp_config_text(
+    settings: &Settings,
+    workspace_dir: &PathBuf,
+) -> Result<String, String> {
+    let mut servers = serde_json::Map::new();
+    for id in &settings.enabled_mcp_servers {
+        if let Some(server) = mcp_preset_server(id, workspace_dir) {
+            servers.insert(id.clone(), server);
+        }
+    }
+    let config = serde_json::json!({
+        "timeouts": {
+            "connect_timeout": 10,
+            "execute_timeout": 300,
+            "read_timeout": 300
+        },
+        "servers": servers
+    });
+    serde_json::to_string_pretty(&config).map_err(|e| e.to_string())
+}
+
+fn mcp_config_text_for_settings(
+    settings: &Settings,
+    workspace_dir: &PathBuf,
+) -> Result<(String, String, String), String> {
+    let custom_path = settings.mcp_config_path.trim();
+    if !custom_path.is_empty() {
+        let path = PathBuf::from(custom_path);
+        if !path.exists() {
+            return Err(format!("MCP config file does not exist: {}", custom_path));
+        }
+        let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let parsed: Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        return Ok((
+            custom_path.to_string(),
+            "custom".to_string(),
+            serde_json::to_string_pretty(&parsed).map_err(|e| e.to_string())?,
+        ));
+    }
+    Ok((
+        get_user_data_dir()
+            .join("mcp.presets.json")
+            .to_string_lossy()
+            .to_string(),
+        "generated".to_string(),
+        generated_mcp_config_text(settings, workspace_dir)?,
+    ))
+}
+
+fn command_exists(command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    let path = PathBuf::from(command);
+    if path.components().count() > 1 {
+        return path.exists();
+    }
+    if let Some(path_value) = std::env::var_os("PATH") {
+        let names = if cfg!(target_os = "windows")
+            && !command.ends_with(".exe")
+            && !command.ends_with(".cmd")
+        {
+            vec![
+                command.to_string(),
+                format!("{}.cmd", command),
+                format!("{}.exe", command),
+            ]
+        } else {
+            vec![command.to_string()]
+        };
+        for dir in std::env::split_paths(&path_value) {
+            if names.iter().any(|name| dir.join(name).exists()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn redact_sensitive_text(value: &str) -> String {
+    let mut redacted_parts = Vec::new();
+    let mut redact_next = false;
+    for part in value.split_whitespace() {
+        let lower = part.to_lowercase();
+        if redact_next {
+            redacted_parts.push("***".to_string());
+            redact_next = false;
+        } else if part.contains("密码")
+            || lower.contains("password")
+            || lower.contains("passwd")
+            || lower.contains("pwd")
+        {
+            redacted_parts.push("***".to_string());
+            if part.ends_with("是") || part.ends_with(':') || part.ends_with('：') || part == "密码"
+            {
+                redact_next = true;
+            }
+        } else {
+            redacted_parts.push(part.to_string());
+        }
+    }
+    redacted_parts.join(" ")
+}
+
 fn looks_like_web_screenshot_request(prompt: &str) -> bool {
     let request = current_user_request(prompt);
     let lower = request.to_lowercase();
     (request.contains("截图")
         || request.contains("截屏")
         || request.contains("截一张")
+        || request.contains("截取")
+        || request.contains("图片")
         || lower.contains("screenshot"))
         && (lower.contains("http://")
             || lower.contains("https://")
             || lower.contains("bilibili")
-            || request.contains("哔哩哔哩"))
+            || lower.contains("b站")
+            || lower.contains("baidu")
+            || request.contains("哔哩哔哩")
+            || request.contains("B站")
+            || request.contains("b站")
+            || request.contains("百度"))
+}
+
+fn looks_like_web_recording_request(prompt: &str) -> bool {
+    let request = current_user_request(prompt);
+    let lower = request.to_lowercase();
+    (request.contains("录制")
+        || request.contains("录屏")
+        || request.contains("短视频")
+        || request.contains("视频")
+        || lower.contains("record")
+        || lower.contains("video"))
+        && (lower.contains("http://")
+            || lower.contains("https://")
+            || lower.contains("bilibili")
+            || lower.contains("b站")
+            || lower.contains("baidu")
+            || request.contains("哔哩哔哩")
+            || request.contains("B站")
+            || request.contains("b站")
+            || request.contains("百度"))
+}
+
+fn looks_like_web_media_request(prompt: &str) -> bool {
+    looks_like_web_screenshot_request(prompt) || looks_like_web_recording_request(prompt)
+}
+
+fn looks_like_mcp_tool_request(prompt: &str) -> bool {
+    let request = current_user_request(prompt);
+    let lower = request.to_lowercase();
+    request.contains("截图")
+        || request.contains("截屏")
+        || request.contains("截一张")
+        || request.contains("截取")
+        || request.contains("浏览器")
+        || request.contains("打开网页")
+        || request.contains("官网")
+        || request.contains("图片")
+        || request.contains("文件")
+        || request.contains("目录")
+        || request.contains("读取")
+        || request.contains("保存")
+        || request.contains("下载")
+        || request.contains("录制")
+        || request.contains("录屏")
+        || request.contains("短视频")
+        || lower.contains("screenshot")
+        || lower.contains("browser")
+        || lower.contains("record")
+        || lower.contains("video")
+        || lower.contains("http://")
+        || lower.contains("https://")
+        || lower.contains("filesystem")
 }
 
 fn current_user_request(prompt: &str) -> String {
@@ -721,10 +1172,314 @@ fn extract_screenshot_url(prompt: &str) -> Option<String> {
         }
     }
     let lower = prompt.to_lowercase();
-    if lower.contains("bilibili") || prompt.contains("哔哩哔哩") {
+    if lower.contains("bilibili")
+        || lower.contains("b站")
+        || prompt.contains("B站")
+        || prompt.contains("b站")
+        || prompt.contains("哔哩哔哩")
+    {
         return Some("https://www.bilibili.com".to_string());
     }
+    if lower.contains("baidu") || prompt.contains("百度") {
+        return Some("https://www.baidu.com".to_string());
+    }
     None
+}
+
+fn normalize_browser_start_url(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(trimmed.to_string());
+    }
+    let lower = trimmed.to_lowercase();
+    if lower.contains('.') && !trimmed.contains(' ') {
+        return Some(format!("https://{}", trimmed.trim_start_matches("//")));
+    }
+    None
+}
+
+fn infer_browser_plan_from_request(request: &str) -> BrowserToolPlan {
+    let lower = request.to_lowercase();
+    let click_target = if should_click_video_before_screenshot(request) {
+        "video".to_string()
+    } else if request.contains("视频") || lower.contains("video") {
+        "video".to_string()
+    } else if request.contains("商品") || lower.contains("product") {
+        "product".to_string()
+    } else if request.contains("文章") || lower.contains("article") {
+        "article".to_string()
+    } else if request.contains("链接")
+        || lower.contains("link")
+        || request.contains("任意")
+        || lower.contains("any")
+    {
+        "link".to_string()
+    } else {
+        String::new()
+    };
+    BrowserToolPlan {
+        start_url: extract_screenshot_url(request).unwrap_or_default(),
+        search_query: extract_search_query(request),
+        click_target,
+        screenshot: looks_like_web_screenshot_request(request),
+        record_seconds: if looks_like_web_recording_request(request) {
+            extract_record_seconds(request)
+        } else {
+            0
+        },
+        login_required: should_prepare_login(request),
+        fullscreen: should_fullscreen_video(request),
+        wait_for_user_seconds: if should_prepare_login(request) { 45 } else { 0 },
+        action_plan: infer_browser_action_plan(request),
+        save_location: if request.contains("桌面") || lower.contains("desktop") {
+            "desktop".to_string()
+        } else {
+            String::new()
+        },
+    }
+}
+
+fn infer_browser_action_plan(request: &str) -> Vec<String> {
+    let mut steps = Vec::new();
+    if should_prepare_login(request) {
+        steps.push("assist_login".to_string());
+    }
+    if !extract_search_query(request).is_empty() {
+        steps.push("search".to_string());
+    }
+    if should_click_video_before_screenshot(request)
+        || request.contains("视频")
+        || request.to_lowercase().contains("video")
+    {
+        steps.push("click_video".to_string());
+    } else if request.contains("进入") || request.contains("点击") {
+        steps.push("click_result".to_string());
+    }
+    if should_fullscreen_video(request) {
+        steps.push("fullscreen".to_string());
+    }
+    if looks_like_web_recording_request(request) {
+        steps.push("record_video".to_string());
+    } else if looks_like_web_screenshot_request(request) {
+        steps.push("screenshot".to_string());
+    }
+    if request.contains("保存")
+        || request.contains("桌面")
+        || request.to_lowercase().contains("desktop")
+    {
+        steps.push("save_file".to_string());
+    }
+    steps
+}
+
+fn extract_search_query(request: &str) -> String {
+    let lower = request.to_lowercase();
+    let has_search = request.contains("搜索") || request.contains("搜") || lower.contains("search");
+    if !has_search {
+        return String::new();
+    }
+    if request.contains("今日热点相关新闻") {
+        return "今日热点相关新闻".to_string();
+    }
+    for marker in [
+        "任意搜索一些",
+        "随便搜索一些",
+        "搜索一些",
+        "去搜一些",
+        "搜一些",
+    ] {
+        if let Some((_, tail)) = request.split_once(marker) {
+            let query = tail
+                .split(|ch| matches!(ch, '，' | ',' | '。' | ';' | '；' | '\n'))
+                .next()
+                .unwrap_or("")
+                .split("然后")
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !query.is_empty() {
+                return query.to_string();
+            }
+        }
+    }
+    let markers = ["搜索", "search"];
+    for marker in markers {
+        if let Some((_, tail)) = request.split_once(marker) {
+            let query = tail
+                .split(|ch| matches!(ch, '，' | ',' | '。' | ';' | '；' | '\n'))
+                .next()
+                .unwrap_or("")
+                .replace("相关新闻", "相关新闻")
+                .trim()
+                .to_string();
+            if !query.is_empty() {
+                return query;
+            }
+        }
+    }
+    String::new()
+}
+
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    Some(&text[start..=end])
+}
+
+fn request_browser_plan_from_model(
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    request: &str,
+) -> Result<BrowserToolPlan, String> {
+    if api_key.trim().is_empty() {
+        return Err("API key is empty".to_string());
+    }
+    let planning_prompt = format!(
+        "你是桌面浏览器自动化 function-calling 路由器。请只输出一个 JSON 对象，不要 Markdown，不要解释。\n\
+你要把用户自然语言转换为可执行浏览器工具计划，字段必须使用下列 schema：\n\
+{{\n\
+  \"start_url\": string,              // http/https URL；站点名请推断常见官方网址\n\
+  \"search_query\": string,           // 页面内搜索词；没有则空字符串\n\
+  \"click_target\": string,           // video/product/article/link/search_result/login/button 等；没有则空字符串\n\
+  \"screenshot\": boolean,            // 是否截图\n\
+  \"record_seconds\": number,         // 是否录制视频，0 表示不录制\n\
+  \"login_required\": boolean,        // 用户是否要求登录\n\
+  \"fullscreen\": boolean,            // 是否要求放大、最大化、全屏或影院模式\n\
+  \"wait_for_user_seconds\": number,  // 登录/验证码/手动操作等待秒数；无需等待则 0\n\
+  \"action_plan\": string[],          // 顺序动作，如 open, assist_login, search, click_video, fullscreen, record_video, screenshot, save_file\n\
+  \"save_location\": \"desktop\" | \"workspace\"\n\
+}}\n\
+规则：\n\
+- 不要编造账号密码字段，不要输出用户密码。\n\
+- 如果用户说“搜一些/搜索一些”，search_query 填后面的主题词。\n\
+- 如果用户要求进入任意视频，click_target 填 video。\n\
+- 如果用户要求录制 7s/10s，record_seconds 填对应数字。\n\
+用户请求：{}",
+        request
+    );
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "user", "content": planning_prompt }
+        ],
+        "stream": false,
+        "temperature": 0
+    });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .post(chat_completions_url(base_url))
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("planning HTTP status {}", response.status()));
+    }
+    let value: Value = response.json().map_err(|e| e.to_string())?;
+    let content = value
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
+        .ok_or_else(|| "planning response has no message.content".to_string())?;
+    let json = extract_json_object(content).ok_or_else(|| {
+        format!(
+            "planning response is not JSON: {}",
+            content.chars().take(160).collect::<String>()
+        )
+    })?;
+    serde_json::from_str::<BrowserToolPlan>(json).map_err(|e| e.to_string())
+}
+
+fn screenshot_output_dir_for_request(
+    request: &str,
+    workspace_dir: &Path,
+    plan: Option<&BrowserToolPlan>,
+) -> PathBuf {
+    let lower = request.to_lowercase();
+    let wants_desktop = plan
+        .map(|plan| plan.save_location.eq_ignore_ascii_case("desktop"))
+        .unwrap_or(false)
+        || request.contains("桌面")
+        || lower.contains("desktop");
+    if wants_desktop {
+        if let Some(desktop) = dirs::desktop_dir() {
+            return desktop;
+        }
+    }
+    if let Some(configured) = configured_screenshot_dir() {
+        return configured;
+    }
+    workspace_dir.join(".ds-code").join("playwright-output")
+}
+
+fn should_click_video_before_screenshot(request: &str) -> bool {
+    let lower = request.to_lowercase();
+    (request.contains("点击")
+        || request.contains("打开")
+        || request.contains("进入")
+        || lower.contains("click"))
+        && (request.contains("视频") || lower.contains("video"))
+}
+
+fn should_scroll_before_click(request: &str) -> bool {
+    let lower = request.to_lowercase();
+    request.contains("下方")
+        || request.contains("往下")
+        || request.contains("向下")
+        || request.contains("下面")
+        || lower.contains("scroll")
+        || lower.contains("below")
+        || lower.contains("down")
+}
+
+fn should_prepare_login(request: &str) -> bool {
+    let lower = request.to_lowercase();
+    request.contains("登录") || lower.contains("login") || lower.contains("sign in")
+}
+
+fn should_fullscreen_video(request: &str) -> bool {
+    let lower = request.to_lowercase();
+    request.contains("放大")
+        || request.contains("全屏")
+        || request.contains("最大化")
+        || lower.contains("fullscreen")
+        || lower.contains("maximize")
+}
+
+fn extract_record_seconds(request: &str) -> u64 {
+    let lower = request.to_lowercase();
+    let mut digits = String::new();
+    for ch in lower.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if !digits.is_empty() {
+            if matches!(ch, 's' | '秒') {
+                if let Ok(value) = digits.parse::<u64>() {
+                    return value.clamp(1, 120);
+                }
+            }
+            digits.clear();
+        }
+    }
+    if !digits.is_empty() && (lower.contains("秒") || lower.contains('s')) {
+        if let Ok(value) = digits.parse::<u64>() {
+            return value.clamp(1, 120);
+        }
+    }
+    10
 }
 
 fn npx_command() -> Command {
@@ -768,20 +1523,375 @@ fn sanitize_filename_piece(value: &str) -> String {
     }
 }
 
-fn run_playwright_screenshot(
+fn playwright_node_script(
+    output_path: &Path,
+    url: &str,
+    search_query: &str,
+    click_target: &str,
+    scroll_before_click: bool,
+    record_seconds: u64,
+    login_requested: bool,
+    fullscreen_requested: bool,
+    wait_for_user_seconds: u64,
+) -> Result<PathBuf, String> {
+    let script_dir = get_user_data_dir().join("runtime");
+    fs::create_dir_all(&script_dir).map_err(|e| e.to_string())?;
+    let script_path = script_dir.join(format!(
+        "playwright-shot-{}.cjs",
+        Utc::now().timestamp_millis()
+    ));
+    let output_json = serde_json::to_string(&output_path.to_string_lossy().to_string())
+        .map_err(|e| e.to_string())?;
+    let url_json = serde_json::to_string(url).map_err(|e| e.to_string())?;
+    let search_query_json = serde_json::to_string(search_query).map_err(|e| e.to_string())?;
+    let click_target_json = serde_json::to_string(click_target).map_err(|e| e.to_string())?;
+    let scroll_before_click_json = if scroll_before_click { "true" } else { "false" };
+    let login_requested_json = if login_requested { "true" } else { "false" };
+    let fullscreen_requested_json = if fullscreen_requested {
+        "true"
+    } else {
+        "false"
+    };
+    let video_temp_dir = output_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".playwright-video-temp");
+    let video_temp_dir_json = serde_json::to_string(&video_temp_dir.to_string_lossy().to_string())
+        .map_err(|e| e.to_string())?;
+    let script = format!(
+        r#"const {{ chromium }} = require("playwright");
+const fs = require("fs");
+const path = require("path");
+
+const targetUrl = {url_json};
+const outputPath = {output_json};
+const searchQuery = {search_query_json};
+const clickTarget = {click_target_json};
+const scrollBeforeClick = {scroll_before_click_json};
+const recordSeconds = {record_seconds};
+const loginRequested = {login_requested_json};
+const fullscreenRequested = {fullscreen_requested_json};
+const waitForUserSeconds = {wait_for_user_seconds};
+const videoTempDir = {video_temp_dir_json};
+
+function selectorForTarget(target) {{
+  const normalized = String(target || "").toLowerCase();
+  if (!normalized) return 'a[href]';
+  if (normalized.includes("video") || normalized.includes("视频")) {{
+    return 'a[href*="/video/"], a[href*="video"], a[href*="watch"], a[href*="play"], a[href]';
+  }}
+  if (normalized.includes("product") || normalized.includes("商品")) {{
+    return 'a[href*="item"], a[href*="product"], a[href*="goods"], a[href]';
+  }}
+  if (normalized.includes("article") || normalized.includes("文章")) {{
+    return 'a[href*="article"], a[href*="post"], a[href*="read"], a[href]';
+  }}
+  return 'a[href]';
+}}
+
+async function runSearch(page, query) {{
+  if (!query) return;
+  console.log("[tool] 正在调用浏览器工具在页面内搜索: " + query);
+  const searchBox = page.locator('textarea[name="wd"]:visible, input[name="wd"]:visible, input[type="search"]:visible, input[name="q"]:visible, input[aria-label*="搜索"]:visible, textarea:visible, input:visible').first();
+  await searchBox.waitFor({{ state: "visible", timeout: 20000 }});
+  console.log("[tool] 已定位搜索输入框，正在输入关键词");
+  await searchBox.fill(query);
+  const searchButton = page.locator('input[type="submit"]:visible, button[type="submit"]:visible, #su:visible, button:has-text("搜索"):visible, input[value*="搜索"]:visible, button:visible').first();
+  console.log("[tool] 正在提交搜索");
+  if (await searchButton.count()) {{
+    await searchButton.click({{ timeout: 10000 }}).catch(async () => {{
+      await searchBox.press("Enter");
+    }});
+  }} else {{
+    await searchBox.press("Enter");
+  }}
+  await page.waitForLoadState("domcontentloaded", {{ timeout: 45000 }}).catch(() => {{}});
+  await page.waitForTimeout(2500);
+  console.log("[tool] 搜索完成，当前页面: " + page.url());
+}}
+
+async function clickSearchResult(page) {{
+  console.log("[tool] 正在查找搜索结果链接");
+  const selectors = [
+    '#content_left h3 a',
+    '.result h3 a',
+    'h3 a[href]',
+    'a[href^="http"]:visible',
+    'a[href]:visible'
+  ];
+  for (const selector of selectors) {{
+    const candidates = page.locator(selector);
+    const count = await candidates.count();
+    console.log("[tool] 搜索结果选择器 " + selector + " 候选数量: " + count);
+    for (let index = 0; index < Math.min(count, 12); index += 1) {{
+      const candidate = candidates.nth(index);
+      try {{
+        const box = await candidate.boundingBox();
+        if (!box || box.width < 40 || box.height < 12) continue;
+        const href = await candidate.getAttribute("href").catch(() => "");
+        const title = (await candidate.innerText({{ timeout: 1000 }}).catch(() => "")).replace(/\s+/g, " ").slice(0, 100);
+        if (!href || /javascript:|#/.test(href)) continue;
+        console.log("[tool] 正在进入搜索结果 #" + (index + 1) + " href=" + href + " title=" + (title || "-"));
+        const popupPromise = page.waitForEvent("popup", {{ timeout: 10000 }}).catch(() => null);
+        await candidate.click({{ timeout: 15000, force: true }});
+        const popup = await popupPromise;
+        const nextPage = popup || page;
+        await nextPage.waitForLoadState("domcontentloaded", {{ timeout: 45000 }}).catch(() => {{}});
+        await nextPage.waitForTimeout(3500);
+        console.log("[tool] 已进入搜索结果页面: " + nextPage.url());
+        return nextPage;
+      }} catch (error) {{
+        console.log("[tool] 搜索结果候选跳过: " + error.message);
+      }}
+    }}
+  }}
+  console.log("[tool] 未能进入搜索结果，将截取当前搜索结果页");
+  return page;
+}}
+
+async function assistLogin(page) {{
+  if (!loginRequested) return;
+  console.log("[tool] 用户要求登录，正在打开登录入口。为避免把密码写入脚本或日志，请在可见浏览器窗口中完成登录/验证码。");
+  const loginSelectors = [
+    'text=/登录|登陆|Sign in|Log in/i',
+    '.header-login-entry',
+    '.login-entry',
+    'a[href*="login"]',
+    'button:has-text("登录")'
+  ];
+  for (const selector of loginSelectors) {{
+    const entry = page.locator(selector).first();
+    if (await entry.count()) {{
+      await entry.click({{ timeout: 5000 }}).catch(() => {{}});
+      break;
+    }}
+  }}
+  const waitSeconds = Math.max(1, waitForUserSeconds || 45);
+  console.log("[tool] 等待用户在浏览器窗口中完成登录/验证码，最多等待 " + waitSeconds + " 秒");
+  await page.waitForTimeout(waitSeconds * 1000);
+  console.log("[tool] 登录等待结束，继续执行后续搜索与录制步骤");
+}}
+
+async function enlargeVideo(page) {{
+  if (!fullscreenRequested) return;
+  console.log("[tool] 用户要求放大视频页面，正在尝试聚焦播放器并进入全屏/影院模式");
+  await page.bringToFront().catch(() => {{}});
+  const video = page.locator('video').first();
+  if (await video.count()) {{
+    await video.click({{ timeout: 5000, force: true }}).catch(() => {{}});
+  }}
+  const buttons = [
+    '[aria-label*="全屏"]',
+    '[title*="全屏"]',
+    '.bpx-player-ctrl-full',
+    '.bpx-player-ctrl-web',
+    'button:has-text("全屏")'
+  ];
+  for (const selector of buttons) {{
+    const button = page.locator(selector).first();
+    if (await button.count()) {{
+      await button.click({{ timeout: 3000, force: true }}).catch(() => {{}});
+      await page.waitForTimeout(1200);
+      break;
+    }}
+  }}
+  await page.keyboard.press("f").catch(() => {{}});
+  await page.waitForTimeout(1800);
+}}
+
+(async () => {{
+  console.log("[tool] Launching Chrome");
+  const browser = await chromium.launch({{ channel: "chrome", headless: false, args: ["--start-maximized"] }});
+  fs.mkdirSync(path.dirname(outputPath), {{ recursive: true }});
+  let context = null;
+  let page;
+  if (recordSeconds > 0) {{
+    fs.mkdirSync(videoTempDir, {{ recursive: true }});
+    console.log("[tool] 已启用浏览器录制，时长 " + recordSeconds + " 秒");
+    context = await browser.newContext({{
+      viewport: {{ width: 1365, height: 900 }},
+      recordVideo: {{ dir: videoTempDir, size: {{ width: 1365, height: 900 }} }}
+    }});
+    page = await context.newPage();
+  }} else {{
+    page = await browser.newPage({{ viewport: {{ width: 1365, height: 900 }} }});
+  }}
+  page.setDefaultTimeout(30000);
+  console.log("[tool] Opening " + targetUrl);
+  await page.goto(targetUrl, {{ waitUntil: "domcontentloaded", timeout: 90000 }});
+  await page.waitForTimeout(3500);
+  let shotPage = page;
+  await assistLogin(page);
+  if (searchQuery) {{
+    await runSearch(page, searchQuery);
+    shotPage = await clickSearchResult(page);
+  }}
+  if (clickTarget) {{
+    if (scrollBeforeClick) {{
+      console.log("[tool] 用户要求导航到页面下方，正在向下滚动以加载下方视频区域");
+      for (let step = 0; step < 4; step += 1) {{
+        await page.mouse.wheel(0, 720);
+        await page.waitForTimeout(900);
+      }}
+    }}
+    console.log("[tool] 正在查找可点击目标: " + clickTarget);
+    const candidates = page.locator(selectorForTarget(clickTarget));
+    const count = await candidates.count();
+    console.log("[tool] 找到候选链接数量: " + count);
+    let clicked = false;
+    for (let index = 0; index < Math.min(count, 36); index += 1) {{
+      const candidate = candidates.nth(index);
+      try {{
+        const box = await candidate.boundingBox();
+        if (!box || box.width < 40 || box.height < 30) continue;
+        if (scrollBeforeClick && box.y < 120) continue;
+        const href = await candidate.getAttribute("href").catch(() => "");
+        const title = (await candidate.innerText({{ timeout: 1000 }}).catch(() => "")).replace(/\s+/g, " ").slice(0, 80);
+        console.log("[tool] 正在点击候选 #" + (index + 1) + " href=" + (href || "-") + " title=" + (title || "-"));
+        const popupPromise = page.waitForEvent("popup", {{ timeout: 10000 }}).catch(() => null);
+        await candidate.click({{ timeout: 15000, force: true }});
+        const popup = await popupPromise;
+        if (popup) {{
+          shotPage = popup;
+          console.log("[tool] 目标在新标签页打开");
+        }} else {{
+          shotPage = page;
+          console.log("[tool] 目标在当前标签页打开");
+        }}
+        clicked = true;
+        break;
+      }} catch (error) {{
+        console.log("[tool] 候选跳过: " + error.message);
+      }}
+    }}
+    if (!clicked) {{
+      console.log("[tool] 没有找到匹配的可点击目标，将截取当前页面");
+    }}
+    await shotPage.waitForLoadState("domcontentloaded", {{ timeout: 45000 }}).catch(() => {{}});
+    await shotPage.waitForTimeout(5000);
+  }}
+  await enlargeVideo(shotPage);
+  if (recordSeconds > 0) {{
+    console.log("[tool] 正在录制目标页面，等待 " + recordSeconds + " 秒");
+    await shotPage.waitForTimeout(recordSeconds * 1000);
+    const video = shotPage.video();
+    if (context) {{
+      await context.close();
+    }}
+    if (video) {{
+      await video.saveAs(outputPath);
+      console.log("[tool] 视频已写入: " + outputPath);
+    }} else {{
+      const files = fs.readdirSync(videoTempDir).filter((name) => name.endsWith(".webm"));
+      if (!files.length) throw new Error("No Playwright video file was produced");
+      const latest = files
+        .map((name) => path.join(videoTempDir, name))
+        .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
+      fs.copyFileSync(latest, outputPath);
+      console.log("[tool] 视频已写入: " + outputPath);
+    }}
+    await browser.close();
+  }} else {{
+    console.log("[tool] 正在截图");
+    await shotPage.screenshot({{ path: outputPath, fullPage: false }});
+    console.log("[tool] 截图已写入: " + outputPath);
+    await browser.close();
+  }}
+}})().catch((error) => {{
+  console.error("[tool] Playwright automation failed: " + (error && error.stack ? error.stack : error));
+  process.exit(1);
+}});
+"#
+    );
+    fs::write(&script_path, script).map_err(|e| e.to_string())?;
+    Ok(script_path)
+}
+
+fn run_playwright_browser_media(
     app: AppHandle,
     session_id: String,
     workspace_dir: PathBuf,
     prompt: String,
+    api_key: String,
+    base_url: String,
+    model: String,
 ) -> (String, i32) {
     let request = current_user_request(&prompt);
-    let Some(url) = extract_screenshot_url(&request) else {
+    let requested_record_seconds = if looks_like_web_recording_request(&request) {
+        extract_record_seconds(&request)
+    } else {
+        0
+    };
+    let action_name = if requested_record_seconds > 0 {
+        "录制"
+    } else {
+        "截图"
+    };
+    emit_terminal_data(
+        &app,
+        &session_id,
+        format!(
+            "[tool] 正在请求模型生成结构化浏览器{}计划...\r\n",
+            action_name
+        ),
+    );
+    let plan = match request_browser_plan_from_model(&api_key, &base_url, &model, &request) {
+        Ok(plan) => {
+            emit_terminal_data(
+                &app,
+                &session_id,
+                "[tool] 模型已返回工具计划，准备执行。\r\n".to_string(),
+            );
+            plan
+        }
+        Err(error) => {
+            emit_terminal_data(
+                &app,
+                &session_id,
+                format!(
+                    "[tool] 模型工具计划不可用，使用本地兜底计划。原因：{}\r\n",
+                    redact_sensitive_text(&error)
+                ),
+            );
+            infer_browser_plan_from_request(&request)
+        }
+    };
+    let record_seconds = if plan.record_seconds > 0 {
+        plan.record_seconds.clamp(1, 120)
+    } else {
+        requested_record_seconds
+    };
+    let action_name = if record_seconds > 0 {
+        "录制"
+    } else {
+        "截图"
+    };
+    let planned_url =
+        normalize_browser_start_url(&plan.start_url).or_else(|| extract_screenshot_url(&request));
+    let Some(url) = planned_url else {
         return (
             "没有找到可截图的网址。请提供 http 或 https 开头的网址。".to_string(),
             -1,
         );
     };
-    let output_dir = workspace_dir.join(".ds-code").join("playwright-output");
+    emit_terminal_data(
+        &app,
+        &session_id,
+        format!(
+            "[tool] 浏览器计划：start_url={}, search_query={}, click_target={}, screenshot={}, save_location={}, record_seconds={}, login_required={}, fullscreen={}, wait_for_user_seconds={}, actions={}\r\n",
+            url,
+            if plan.search_query.trim().is_empty() { "-" } else { plan.search_query.trim() },
+            if plan.click_target.trim().is_empty() { "-" } else { plan.click_target.trim() },
+            plan.screenshot,
+            if plan.save_location.trim().is_empty() { "workspace" } else { plan.save_location.trim() },
+            record_seconds,
+            plan.login_required,
+            plan.fullscreen,
+            plan.wait_for_user_seconds,
+            if plan.action_plan.is_empty() { "-".to_string() } else { plan.action_plan.join(" -> ") }
+        ),
+    );
+    let output_dir = screenshot_output_dir_for_request(&request, &workspace_dir, Some(&plan));
     if let Err(error) = fs::create_dir_all(&output_dir) {
         return (format!("创建截图输出目录失败：{}", error), -1);
     }
@@ -790,74 +1900,258 @@ fn run_playwright_screenshot(
             .trim_start_matches("http://")
             .trim_start_matches("www."),
     );
+    let extension = if record_seconds > 0 { "webm" } else { "png" };
     let output_path = output_dir.join(format!(
-        "{}-{}.png",
+        "{}-{}.{}",
         url_name,
-        Utc::now().timestamp_millis()
+        Utc::now().timestamp_millis(),
+        extension
     ));
     emit_terminal_data(
         &app,
         &session_id,
         format!(
-            "正在使用 Playwright 打开 {}\r\n截图将保存到 {}\r\n",
+            "[tool] 已解析浏览器目标：{}\r\n[tool] 输出位置：{}\r\n[tool] 正在启动 Playwright/Chrome...\r\n",
             url,
             output_path.to_string_lossy()
         ),
     );
     let output_path_string = output_path.to_string_lossy().to_string();
+    let click_target = if !plan.click_target.trim().is_empty() {
+        plan.click_target.trim().to_string()
+    } else if !plan.search_query.trim().is_empty() || request.contains("搜索") {
+        if request.contains("视频") || request.to_lowercase().contains("video") {
+            "video".to_string()
+        } else {
+            "search_result".to_string()
+        }
+    } else if should_click_video_before_screenshot(&request) {
+        "video".to_string()
+    } else {
+        String::new()
+    };
+    let scroll_before_click = should_scroll_before_click(&request);
+    let login_requested = plan.login_required || should_prepare_login(&request);
+    let fullscreen_requested = plan.fullscreen || should_fullscreen_video(&request);
+    let wait_for_user_seconds = if plan.wait_for_user_seconds > 0 {
+        plan.wait_for_user_seconds.clamp(1, 180)
+    } else if login_requested {
+        45
+    } else {
+        0
+    };
     let mut command = npx_command();
-    let result = command
-        .args([
-            "playwright",
-            "screenshot",
-            "--browser=chromium",
-            "--channel=chrome",
-            "--timeout=90000",
+    if !click_target.is_empty() || !plan.search_query.trim().is_empty() {
+        emit_terminal_data(
+            &app,
+            &session_id,
+            format!(
+                "[tool] 已识别为“浏览器自动化后{}”，search_query={}, click_target={}, scroll_before_click={}, login_requested={}, fullscreen_requested={}, wait_for_user_seconds={}，将执行浏览器自动化脚本...\r\n",
+                action_name,
+                if plan.search_query.trim().is_empty() { "-" } else { plan.search_query.trim() },
+                if click_target.is_empty() { "-" } else { click_target.as_str() },
+                scroll_before_click,
+                login_requested,
+                fullscreen_requested,
+                wait_for_user_seconds
+            ),
+        );
+    }
+    let spawn_result = if !click_target.is_empty() || !plan.search_query.trim().is_empty() {
+        match playwright_node_script(
+            &output_path,
             &url,
-            &output_path_string,
-        ])
-        .current_dir(&workspace_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
-
-    match result {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let combined = format!("{}{}", stdout, stderr);
-            if !combined.trim().is_empty() {
-                emit_terminal_data(&app, &session_id, combined);
+            plan.search_query.trim(),
+            &click_target,
+            scroll_before_click,
+            record_seconds,
+            login_requested,
+            fullscreen_requested,
+            wait_for_user_seconds,
+        ) {
+            Ok(script_path) => command
+                .args([
+                    "--yes",
+                    "--package",
+                    "playwright",
+                    "node",
+                    &script_path.to_string_lossy().to_string(),
+                ])
+                .current_dir(&workspace_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn(),
+            Err(error) => return (format!("创建 Playwright 自动化脚本失败：{}", error), -1),
+        }
+    } else {
+        if record_seconds > 0 {
+            match playwright_node_script(
+                &output_path,
+                &url,
+                "",
+                "",
+                false,
+                record_seconds,
+                login_requested,
+                fullscreen_requested,
+                wait_for_user_seconds,
+            ) {
+                Ok(script_path) => command
+                    .args([
+                        "--yes",
+                        "--package",
+                        "playwright",
+                        "node",
+                        &script_path.to_string_lossy().to_string(),
+                    ])
+                    .current_dir(&workspace_dir)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn(),
+                Err(error) => return (format!("创建 Playwright 录制脚本失败：{}", error), -1),
             }
-            if output.status.success() && output_path.exists() {
-                (format!("截图已保存：{}", output_path.to_string_lossy()), 0)
-            } else {
-                (
+        } else {
+            command
+                .args([
+                    "playwright",
+                    "screenshot",
+                    "--browser=chromium",
+                    "--channel=chrome",
+                    "--timeout=90000",
+                    &url,
+                    &output_path_string,
+                ])
+                .current_dir(&workspace_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        }
+    };
+
+    let mut child = match spawn_result {
+        Ok(child) => child,
+        Err(error) => {
+            return (
+                format!("启动 Playwright {}失败：{}", action_name, error),
+                -1,
+            )
+        }
+    };
+
+    fn spawn_pipe_reader<R: Read + Send + 'static>(
+        mut reader: R,
+        app: AppHandle,
+        session_id: String,
+        output_buffer: Arc<Mutex<String>>,
+    ) {
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 1024];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = String::from_utf8_lossy(&buffer[..n]).to_string();
+                        if let Ok(mut output) = output_buffer.lock() {
+                            output.push_str(&data);
+                        }
+                        emit_terminal_data(&app, &session_id, data);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    let output_buffer = Arc::new(Mutex::new(String::new()));
+    if let Some(reader) = child.stdout.take() {
+        spawn_pipe_reader(
+            reader,
+            app.clone(),
+            session_id.clone(),
+            output_buffer.clone(),
+        );
+    }
+    if let Some(reader) = child.stderr.take() {
+        spawn_pipe_reader(
+            reader,
+            app.clone(),
+            session_id.clone(),
+            output_buffer.clone(),
+        );
+    }
+
+    let mut ticks = 0;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let combined = output_buffer
+                    .lock()
+                    .map(|output| output.clone())
+                    .unwrap_or_default();
+                if status.success() && output_path.exists() {
+                    emit_terminal_data(
+                        &app,
+                        &session_id,
+                        format!(
+                            "[tool] 页面{}完成，文件已写入：{}\r\n",
+                            action_name,
+                            output_path.to_string_lossy()
+                        ),
+                    );
+                    if record_seconds > 0 {
+                        return (
+                            format!(
+                                "视频已保存：{}\n视频所在文件夹：{}",
+                                output_path.to_string_lossy(),
+                                output_dir.to_string_lossy()
+                            ),
+                            0,
+                        );
+                    }
+                    return (
+                        format!(
+                            "截图已保存：{}\n截图所在文件夹：{}",
+                            output_path.to_string_lossy(),
+                            output_dir.to_string_lossy()
+                        ),
+                        0,
+                    );
+                }
+                return (
                     format!(
-                        "截图失败，退出码：{}。\n{}",
-                        output.status.code().unwrap_or(-1),
-                        stderr
+                        "{}失败，退出码：{}。\n{}",
+                        action_name,
+                        status.code().unwrap_or(-1),
+                        combined
                     ),
-                    output.status.code().unwrap_or(-1),
+                    status.code().unwrap_or(-1),
+                );
+            }
+            Ok(None) => {
+                ticks += 1;
+                if ticks == 1 {
+                    emit_terminal_data(
+                        &app,
+                        &session_id,
+                        "[tool] Chrome 已启动，正在打开页面并等待加载...\r\n".to_string(),
+                    );
+                } else if ticks % 4 == 0 {
+                    emit_terminal_data(
+                        &app,
+                        &session_id,
+                        format!("[tool] 页面仍在加载或{}处理中...\r\n", action_name),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(750));
+            }
+            Err(error) => {
+                return (
+                    format!("等待 Playwright {}失败：{}", action_name, error),
+                    -1,
                 )
             }
         }
-        Err(error) => (format!("启动 Playwright 截图失败：{}", error), -1),
     }
-}
-
-fn is_only_progress_output(output: &str) -> bool {
-    let normalized = output.replace('\r', "\n");
-    let clean = normalized
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .filter(|line| {
-            let lower = line.to_lowercase();
-            !lower.contains("正在请求") && !lower.contains("requesting")
-        })
-        .collect::<Vec<_>>();
-    clean.is_empty()
 }
 
 fn chat_completions_url(base_url: &str) -> String {
@@ -898,28 +2192,98 @@ fn emit_terminal_data(app: &AppHandle, session_id: &str, data: String) {
     if data.is_empty() {
         return;
     }
+    let emit_chunk = |text: String| {
+        let session_json = serde_json::to_string(session_id).unwrap_or_else(|_| "\"\"".to_string());
+        let text_json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
+        if let Some(window) = app.get_webview_window("main") {
+            let script = format!(
+                "window.__deepseekDesktopStreamPush && window.__deepseekDesktopStreamPush({}, {});",
+                session_json, text_json
+            );
+            let _ = window.eval(&script);
+        } else {
+            let _ = app.emit(
+                "terminal:data",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "data": text,
+                }),
+            );
+        }
+    };
     let chars: Vec<char> = data.chars().collect();
     if chars.len() <= 120 {
-        let _ = app.emit(
-            "terminal:data",
-            serde_json::json!({
-                "sessionId": session_id,
-                "data": data,
-            }),
-        );
+        emit_chunk(data);
         return;
     }
     for chunk in chars.chunks(64) {
         let text: String = chunk.iter().collect();
-        let _ = app.emit(
-            "terminal:data",
-            serde_json::json!({
-                "sessionId": session_id,
-                "data": text,
-            }),
-        );
+        emit_chunk(text);
         std::thread::sleep(std::time::Duration::from_millis(18));
     }
+}
+
+fn emit_stream_text(app: &AppHandle, session_id: &str, data: &str) {
+    if data.is_empty() {
+        return;
+    }
+    let chars: Vec<char> = data.chars().collect();
+    for chunk in chars.chunks(32) {
+        let text: String = chunk.iter().collect();
+        let session_json = serde_json::to_string(session_id).unwrap_or_else(|_| "\"\"".to_string());
+        let text_json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
+        let script = format!(
+            "window.__deepseekDesktopStreamPush && window.__deepseekDesktopStreamPush({}, {});",
+            session_json, text_json
+        );
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.eval(&script);
+        } else {
+            let _ = app.emit(
+                "terminal:data",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "data": text,
+                }),
+            );
+        }
+    }
+}
+
+fn handle_stream_event(
+    app: &AppHandle,
+    session_id: &str,
+    event: &str,
+    content: &mut String,
+    reasoning: &mut String,
+) -> Result<bool, String> {
+    for line in event.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            return Ok(true);
+        }
+        let value = serde_json::from_str::<Value>(data).map_err(|e| e.to_string())?;
+        let (delta, reasoning_delta) = extract_stream_delta(&value);
+        if !reasoning_delta.is_empty() {
+            if reasoning.is_empty() {
+                emit_terminal_data(app, session_id, "\r\n[reasoning]\r\n".to_string());
+            }
+            reasoning.push_str(&reasoning_delta);
+            emit_stream_text(app, session_id, &reasoning_delta);
+        }
+        if !delta.is_empty() {
+            content.push_str(&delta);
+            emit_stream_text(app, session_id, &delta);
+        }
+    }
+    Ok(false)
 }
 
 fn run_deepseek_streaming(
@@ -962,140 +2326,39 @@ fn run_deepseek_streaming(
 
     let mut content = String::new();
     let mut reasoning = String::new();
-    let reader = BufReader::new(response);
-    for line in reader.lines() {
-        let line = line.map_err(|e| e.to_string())?;
-        let line = line.trim();
-        if line.is_empty() || line.starts_with(':') {
-            continue;
-        }
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data == "[DONE]" {
+    let mut stream = response;
+    let mut buffer = [0u8; 2048];
+    let mut pending = String::new();
+    loop {
+        let n = stream.read(&mut buffer).map_err(|e| e.to_string())?;
+        if n == 0 {
             break;
         }
-        let value = serde_json::from_str::<Value>(data).map_err(|e| e.to_string())?;
-        let (delta, reasoning_delta) = extract_stream_delta(&value);
-        if !reasoning_delta.is_empty() {
-            if reasoning.is_empty() {
-                let marker = "\r\n[reasoning]\r\n";
-                let _ = app.emit(
-                    "terminal:data",
-                    serde_json::json!({
-                        "sessionId": session_id,
-                        "data": marker,
-                    }),
-                );
+        pending.push_str(&String::from_utf8_lossy(&buffer[..n]));
+        while let Some(index) = pending.find("\n\n").or_else(|| pending.find("\r\n\r\n")) {
+            let delimiter_len = if pending[index..].starts_with("\r\n\r\n") {
+                4
+            } else {
+                2
+            };
+            let event = pending[..index].to_string();
+            pending = pending[index + delimiter_len..].to_string();
+            if handle_stream_event(app, session_id, &event, &mut content, &mut reasoning)? {
+                return if content.trim().is_empty() {
+                    Ok((reasoning, 0))
+                } else {
+                    Ok((content, 0))
+                };
             }
-            reasoning.push_str(&reasoning_delta);
-            emit_terminal_data(app, session_id, reasoning_delta);
         }
-        if !delta.is_empty() {
-            content.push_str(&delta);
-            emit_terminal_data(app, session_id, delta);
-        }
+    }
+    if !pending.trim().is_empty() {
+        let _ = handle_stream_event(app, session_id, &pending, &mut content, &mut reasoning)?;
     }
     if content.trim().is_empty() {
         return Ok((reasoning, 0));
     }
     Ok((content, 0))
-}
-
-fn collect_exec_process(app: AppHandle, session_id: String, mut child: Child) -> (String, i32) {
-    let started_at = std::time::Instant::now();
-    let child_pid = child.id();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let (chunk_tx, chunk_rx) = mpsc::channel::<String>();
-    if let Some(mut stream) = stdout {
-        let chunk_tx = chunk_tx.clone();
-        std::thread::spawn(move || {
-            let mut buffer = [0u8; 4096];
-            loop {
-                match stream.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let _ = chunk_tx.send(String::from_utf8_lossy(&buffer[..n]).to_string());
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-    if let Some(mut stream) = stderr {
-        let chunk_tx = chunk_tx.clone();
-        std::thread::spawn(move || {
-            let mut buffer = [0u8; 4096];
-            loop {
-                match stream.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let _ = chunk_tx.send(String::from_utf8_lossy(&buffer[..n]).to_string());
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-    drop(chunk_tx);
-    let mut output = String::new();
-    let exit_code = loop {
-        while let Ok(chunk) = chunk_rx.try_recv() {
-            output.push_str(&chunk);
-            emit_terminal_data(&app, &session_id, chunk);
-        }
-        if started_at.elapsed() > std::time::Duration::from_secs(300) {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &child_pid.to_string(), "/T", "/F"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let _ = child.kill();
-            break -1;
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status.code().unwrap_or(-1),
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
-            Err(_) => break -1,
-        }
-    };
-    let drain_until = std::time::Instant::now() + std::time::Duration::from_millis(750);
-    while std::time::Instant::now() < drain_until {
-        match chunk_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(chunk) => {
-                output.push_str(&chunk);
-                emit_terminal_data(&app, &session_id, chunk);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    if exit_code == -1 && is_only_progress_output(&output) {
-        output.push_str(
-            "\r\nDeepSeek 请求超时：300 秒内没有收到模型响应。请检查网络、代理、Base URL 或 MCP 服务启动状态。\r\n",
-        );
-    } else if exit_code == 0 && is_only_progress_output(&output) {
-        output.push_str("\r\nDeepSeek 进程已退出，但没有返回模型内容；只收到了请求进度。请检查 API Key、网络代理、Base URL 和 MCP 配置。\r\n");
-    }
-    let output_preview = output.replace('\r', "\\r").replace('\n', "\\n");
-    let output_preview = if output_preview.chars().count() > 240 {
-        format!(
-            "{}...",
-            output_preview.chars().take(240).collect::<String>()
-        )
-    } else {
-        output_preview
-    };
-    info!(
-        "Terminal exec session completed: {}, exitCode={}, outputBytes={}, outputPreview={}",
-        session_id,
-        exit_code,
-        output.len(),
-        output_preview
-    );
-    (output, exit_code)
 }
 
 #[tauri::command]
@@ -1149,6 +2412,12 @@ fn terminal_start(
         .to_string();
     let model = settings.model.trim().to_string();
     let provider = settings.provider.trim().to_string();
+    let skill_prompt_prefix = build_skill_prompt_prefix(&settings);
+    let skills_dir_for_env = if settings.skills_dir.trim().is_empty() {
+        get_skills_dir().to_string_lossy().to_string()
+    } else {
+        settings.skills_dir.trim().to_string()
+    };
     let mut args: Vec<String> = Vec::new();
 
     if !provider.is_empty() {
@@ -1180,13 +2449,18 @@ fn terminal_start(
             let prompt = match options.launch_action.as_str() {
                 "plan" => format!(
                     "{}\n请只输出实施计划和风险点，不要修改文件或执行破坏性操作。\n\n{}",
-                    language_instruction, options.agent_prompt
+                    language_instruction,
+                    format!("{}{}", skill_prompt_prefix, options.agent_prompt)
                 ),
                 "yolo" => format!(
                     "{}\n在当前 workspace 中完成用户请求。可以进行必要的代码修改和验证；遇到高风险或破坏性操作时先说明原因。\n\n{}",
-                    language_instruction, options.agent_prompt
+                    language_instruction,
+                    format!("{}{}", skill_prompt_prefix, options.agent_prompt)
                 ),
-                _ => format!("{}\n\n{}", language_instruction, options.agent_prompt),
+                _ => format!(
+                    "{}\n\n{}{}",
+                    language_instruction, skill_prompt_prefix, options.agent_prompt
+                ),
             };
             args.extend(["exec".to_string(), "--auto".to_string(), prompt]);
             if settings.mcp_enabled {
@@ -1215,7 +2489,7 @@ fn terminal_start(
                 Some("***".to_string())
             } else {
                 *redact_next = arg == "--api-key";
-                Some(arg.clone())
+                Some(redact_sensitive_text(arg))
             }
         })
         .collect();
@@ -1240,22 +2514,28 @@ fn terminal_start(
             .enabled_mcp_servers
             .iter()
             .any(|id| id == "playwright")
-        && looks_like_web_screenshot_request(&options.agent_prompt)
+        && looks_like_web_media_request(&options.agent_prompt)
     {
         info!(
-            "Starting direct Playwright screenshot fallback: {}",
+            "Starting direct Playwright browser media fallback: {}",
             session_id
         );
         let shot_app = app.clone();
         let shot_session_id = session_id.clone();
         let shot_workspace_dir = mcp_workspace_dir.clone();
         let shot_prompt = options.agent_prompt.clone();
+        let shot_api_key = api_key.clone();
+        let shot_base_url = normalized_base_url.clone();
+        let shot_model = model.clone();
         std::thread::spawn(move || {
-            let (output, exit_code) = run_playwright_screenshot(
+            let (output, exit_code) = run_playwright_browser_media(
                 shot_app.clone(),
                 shot_session_id.clone(),
                 shot_workspace_dir,
                 shot_prompt,
+                shot_api_key,
+                shot_base_url,
+                shot_model,
             );
             emit_terminal_data(&shot_app, &shot_session_id, format!("\r\n{}\r\n", output));
             if let Ok(mut results) = TERMINAL_RESULTS.lock() {
@@ -1287,9 +2567,26 @@ fn terminal_start(
         });
     }
 
+    let should_use_mcp_cli =
+        settings.mcp_enabled && looks_like_mcp_tool_request(&options.agent_prompt);
+    if matches!(options.launch_action.as_str(), "exec" | "plan" | "yolo") && should_use_mcp_cli {
+        emit_terminal_data(
+            &app,
+            &session_id,
+            format!(
+                "[tool] MCP 路由：该请求需要外部工具，已选择 deepseek CLI + MCP 执行。\r\n[tool] MCP servers: {}\r\n[tool] MCP config: {}\r\n",
+                if settings.enabled_mcp_servers.is_empty() {
+                    "(custom config)".to_string()
+                } else {
+                    settings.enabled_mcp_servers.join(",")
+                },
+                mcp_config_path.clone().unwrap_or_else(|| "(none)".to_string())
+            ),
+        );
+    }
     if matches!(options.launch_action.as_str(), "exec" | "plan" | "yolo")
         && provider == "deepseek"
-        && !settings.mcp_enabled
+        && !should_use_mcp_cli
     {
         info!(
             "Starting DeepSeek HTTP streaming session: {}, model={}, url={}, processStream={}",
@@ -1414,9 +2711,16 @@ fn terminal_start(
         );
         info!("MCP config set: {}", path);
     }
+    if settings.skills_enabled {
+        cmd.env("DEEPSEEK_SKILLS_DIR", &skills_dir_for_env);
+        cmd.env(
+            "DEEPSEEK_DESKTOP_ENABLED_SKILLS",
+            settings.enabled_skills.join(","),
+        );
+    }
 
     if matches!(options.launch_action.as_str(), "exec" | "plan" | "yolo") {
-        if settings.harness_enabled && provider == "deepseek" && !settings.mcp_enabled {
+        if settings.harness_enabled && provider == "deepseek" && !should_use_mcp_cli {
             info!(
                 "Starting DeepSeek HTTP streaming session: {}, model={}, url={}",
                 session_id,
@@ -1491,50 +2795,67 @@ fn terminal_start(
             });
         }
 
-        let mut process_cmd = Command::new(&binary_path);
-        process_cmd
-            .args(&args)
-            .current_dir(&workspace_dir_string)
-            .env("TERM", "xterm-256color")
-            .env("COLORTERM", "truecolor")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        if !api_key.is_empty() {
-            if provider == "nvidia-nim" {
-                process_cmd.env("NVIDIA_API_KEY", &api_key);
-                process_cmd.env("NVIDIA_NIM_API_KEY", &api_key);
-            } else {
-                process_cmd.env("DEEPSEEK_API_KEY", &api_key);
-            }
-        }
-        if !normalized_base_url.is_empty() {
-            process_cmd.env("DEEPSEEK_BASE_URL", &normalized_base_url);
-        }
-        if !model.is_empty() {
-            process_cmd.env("DEEPSEEK_MODEL", &model);
-        }
-        if !provider.is_empty() {
-            process_cmd.env("DEEPSEEK_PROVIDER", &provider);
-        }
-        if let Some(path) = &mcp_config_path {
-            process_cmd.env("DEEPSEEK_MCP_CONFIG", path);
-            process_cmd.env(
-                "DEEPSEEK_DESKTOP_ENABLED_MCP",
-                settings.enabled_mcp_servers.join(","),
-            );
-        }
-
-        let child = process_cmd.spawn().map_err(|e| {
-            error!("Failed to spawn deepseek exec: {}", e);
+        let mut child = pair.slave.spawn_command(cmd).map_err(|e| {
+            error!("Failed to spawn deepseek exec PTY: {}", e);
             e.to_string()
         })?;
-        let pid = child.id();
+        if should_use_mcp_cli {
+            emit_terminal_data(
+                &app,
+                &session_id,
+                "[tool] 已启动 MCP CLI 进程，正在等待模型规划和工具调用输出...\r\n".to_string(),
+            );
+        }
+        let pid = child.process_id();
+        let killer = child.clone_killer();
+        let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+        {
+            let mut sessions = TERMINAL_SESSIONS.lock().unwrap();
+            sessions.insert(session_id.clone(), TerminalSession::new(writer, killer));
+        }
+
         let exec_app = app.clone();
         let exec_session_id = session_id.clone();
+        let output_buffer = Arc::new(Mutex::new(String::new()));
+        let reader_output = output_buffer.clone();
+        let reader_app = app.clone();
+        let reader_session_id = session_id.clone();
         std::thread::spawn(move || {
-            let (output, exit_code) =
-                collect_exec_process(exec_app.clone(), exec_session_id.clone(), child);
+            let mut reader = pair.master.try_clone_reader().unwrap();
+            let mut buffer = [0u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = String::from_utf8_lossy(&buffer[..n]).to_string();
+                        if let Ok(mut output) = reader_output.lock() {
+                            output.push_str(&data);
+                            if output.len() > 120000 {
+                                let keep_from = output.len().saturating_sub(120000);
+                                *output = output[keep_from..].to_string();
+                            }
+                        }
+                        emit_terminal_data(&reader_app, &reader_session_id, data);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        std::thread::spawn(move || {
+            let exit_code = child
+                .wait()
+                .ok()
+                .map(|status| status.exit_code() as i32)
+                .unwrap_or(-1);
+            {
+                let mut sessions = TERMINAL_SESSIONS.lock().unwrap();
+                sessions.remove(&exec_session_id);
+            }
+            let output = output_buffer
+                .lock()
+                .map(|output| output.clone())
+                .unwrap_or_default();
             if let Ok(mut results) = TERMINAL_RESULTS.lock() {
                 results.insert(
                     exec_session_id.clone(),
@@ -1558,7 +2879,7 @@ fn terminal_start(
         return Ok(TerminalStartResult {
             ok: true,
             error: String::new(),
-            pid: Some(pid),
+            pid,
             session_id: Some(session_id),
             final_output: None,
             exit_code: None,
@@ -1676,8 +2997,29 @@ pub struct SkillTemplate {
     pub name: String,
     pub description: String,
     pub source: String,
+    pub origin: String,
     pub path: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillTemplateActionResult {
+    pub ok: bool,
+    pub error: String,
+    pub skill: Option<SkillTemplate>,
+    #[serde(rename = "skillRoot")]
+    pub skill_root: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillImportActionResult {
+    pub ok: bool,
+    pub error: String,
+    pub skills: Vec<SkillTemplate>,
+    #[serde(rename = "skillRoot")]
+    pub skill_root: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1703,14 +3045,26 @@ fn get_customization(settings: Settings) -> Result<CustomizationResult, String> 
     } else {
         settings.skills_dir.clone()
     };
+    let skill_templates = load_skill_templates(&PathBuf::from(&skill_root))?;
+    let workspace_dir = resolve_workspace_dir(&settings.workspace_path);
+    let (mcp_config_path, mcp_config_source, mcp_config_text, mcp_config_error) =
+        match mcp_config_text_for_settings(&settings, &workspace_dir) {
+            Ok((path, source, text)) => (path, source, text, String::new()),
+            Err(error) => (
+                settings.mcp_config_path.clone(),
+                "missing".to_string(),
+                "{}".to_string(),
+                error,
+            ),
+        };
 
     Ok(CustomizationResult {
         skill_root,
-        skill_templates: HashMap::new(),
-        mcp_config_path: settings.mcp_config_path,
-        mcp_config_source: "generated".to_string(),
-        mcp_config_text: "{}".to_string(),
-        mcp_config_error: String::new(),
+        skill_templates,
+        mcp_config_path,
+        mcp_config_source,
+        mcp_config_text,
+        mcp_config_error,
     })
 }
 
@@ -1720,33 +3074,66 @@ fn create_skill_template(
     name: String,
     description: String,
     content: String,
-) -> Result<SkillTemplate, String> {
+) -> Result<SkillTemplateActionResult, String> {
     let skills_dir = get_skills_dir();
-    let skill_dir = skills_dir.join(&skill_id);
+    let id = sanitize_id(
+        if skill_id.trim().is_empty() {
+            &name
+        } else {
+            &skill_id
+        },
+        "custom-skill",
+    );
+    let display_name = if name.trim().is_empty() {
+        id.clone()
+    } else {
+        name.trim().to_string()
+    };
+    let description = if description.trim().is_empty() {
+        format!("Use when {} guidance is needed.", display_name)
+    } else {
+        description.trim().to_string()
+    };
+    let skill_dir = skills_dir.join(&id);
     let skill_file = skill_dir.join("SKILL.md");
 
     fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
 
+    let body = if content.trim().is_empty() {
+        "## Overview\n\nDescribe the reusable workflow, trigger conditions, and verification steps for this skill.\n"
+            .to_string()
+    } else {
+        content
+    };
     let frontmatter = format!(
         "---\nname: {}\ndescription: {}\n---\n\n# {}\n\n{}",
-        skill_id, description, name, content
+        id, description, display_name, body
     );
 
     let content_for_return = frontmatter.clone();
     fs::write(&skill_file, &frontmatter).map_err(|e| e.to_string())?;
 
-    Ok(SkillTemplate {
-        id: skill_id,
-        name,
+    let skill = SkillTemplate {
+        id,
+        name: display_name,
         description,
-        source: "custom".to_string(),
+        source: "file".to_string(),
+        origin: "custom".to_string(),
         path: skill_file.to_string_lossy().to_string(),
         content: content_for_return,
+    };
+
+    Ok(SkillTemplateActionResult {
+        ok: true,
+        error: String::new(),
+        skill: Some(skill.clone()),
+        skill_root: skills_dir.to_string_lossy().to_string(),
+        path: skill.path,
     })
 }
 
 #[tauri::command]
-fn import_skill_directory(source_path: String) -> Result<Vec<SkillTemplate>, String> {
+fn import_skill_directory(source_path: String) -> Result<SkillImportActionResult, String> {
     let source = PathBuf::from(&source_path);
     if !source.exists() {
         return Err("Source directory does not exist".to_string());
@@ -1767,16 +3154,19 @@ fn import_skill_directory(source_path: String) -> Result<Vec<SkillTemplate>, Str
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
+                    let id = sanitize_id(&id, "imported-skill");
                     let skill_dir = skills_dir.join(&id);
+                    let copied_file = skill_dir.join("SKILL.md");
                     fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
-                    fs::copy(&skill_file, skill_dir.join("SKILL.md")).map_err(|e| e.to_string())?;
+                    fs::copy(&skill_file, &copied_file).map_err(|e| e.to_string())?;
 
                     imported.push(SkillTemplate {
                         id: id.clone(),
-                        name: id.clone(),
-                        description: String::new(),
-                        source: "imported".to_string(),
-                        path: skill_file.to_string_lossy().to_string(),
+                        name: skill_name_from_content(&id, &content),
+                        description: skill_description_from_content(&content),
+                        source: "file".to_string(),
+                        origin: "custom".to_string(),
+                        path: copied_file.to_string_lossy().to_string(),
                         content,
                     });
                 }
@@ -1784,16 +3174,37 @@ fn import_skill_directory(source_path: String) -> Result<Vec<SkillTemplate>, Str
         }
     }
 
-    Ok(imported)
+    Ok(SkillImportActionResult {
+        ok: true,
+        error: String::new(),
+        skills: imported,
+        skill_root: skills_dir.to_string_lossy().to_string(),
+        path: skills_dir.to_string_lossy().to_string(),
+    })
 }
 
 // MCP commands
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConfigSaveResult {
+    pub ok: bool,
+    pub error: String,
+    pub path: String,
+    pub content: String,
+}
+
 #[tauri::command]
-fn save_mcp_config(content: String) -> Result<String, String> {
+fn save_mcp_config(content: String) -> Result<McpConfigSaveResult, String> {
     ensure_user_data_dir().map_err(|e| e.to_string())?;
+    let parsed: Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    let formatted = serde_json::to_string_pretty(&parsed).map_err(|e| e.to_string())?;
     let path = get_user_data_dir().join("mcp.custom.json");
-    fs::write(&path, content).map_err(|e| e.to_string())?;
-    Ok(path.to_string_lossy().to_string())
+    fs::write(&path, &formatted).map_err(|e| e.to_string())?;
+    Ok(McpConfigSaveResult {
+        ok: true,
+        error: String::new(),
+        path: path.to_string_lossy().to_string(),
+        content: formatted,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1810,21 +3221,140 @@ pub struct McpServerTestResult {
 pub struct McpServerStatus {
     pub id: String,
     pub command: String,
+    pub args: Vec<String>,
+    pub url: String,
     pub ok: bool,
     #[serde(rename = "commandFound")]
     pub command_found: bool,
     #[serde(rename = "missingEnv")]
     pub missing_env: Vec<String>,
     pub warnings: Vec<String>,
+    pub error: String,
 }
 
 #[tauri::command]
 fn test_mcp_servers(settings: Settings) -> McpServerTestResult {
+    let workspace_dir = resolve_workspace_dir(&settings.workspace_path);
+    let config_result = mcp_config_text_for_settings(&settings, &workspace_dir);
+    let (config_path, config_text) = match config_result {
+        Ok((path, _, text)) => (path, text),
+        Err(error) => {
+            return McpServerTestResult {
+                ok: false,
+                tested_at: Utc::now().to_rfc3339(),
+                config_path: settings.mcp_config_path,
+                servers: vec![McpServerStatus {
+                    id: "config".to_string(),
+                    command: String::new(),
+                    args: vec![],
+                    url: String::new(),
+                    ok: false,
+                    command_found: false,
+                    missing_env: vec![],
+                    warnings: vec![error.clone()],
+                    error,
+                }],
+            }
+        }
+    };
+    let parsed: Value = match serde_json::from_str(&config_text) {
+        Ok(value) => value,
+        Err(error) => {
+            return McpServerTestResult {
+                ok: false,
+                tested_at: Utc::now().to_rfc3339(),
+                config_path,
+                servers: vec![McpServerStatus {
+                    id: "config".to_string(),
+                    command: String::new(),
+                    args: vec![],
+                    url: String::new(),
+                    ok: false,
+                    command_found: false,
+                    missing_env: vec![],
+                    warnings: vec![format!("Invalid JSON: {}", error)],
+                    error: error.to_string(),
+                }],
+            }
+        }
+    };
+    let servers = parsed
+        .get("servers")
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut statuses = Vec::new();
+    for (id, server) in servers {
+        let disabled = server
+            .get("disabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let enabled = server
+            .get("enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        if disabled || !enabled {
+            continue;
+        }
+        let command = server
+            .get("command")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let args = server
+            .get("args")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let url = server
+            .get("url")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let mut missing_env = Vec::new();
+        if let Some(env) = server.get("env").and_then(|value| value.as_object()) {
+            for (key, value) in env {
+                let configured_value = value.as_str().unwrap_or_default().trim();
+                let missing = configured_value.is_empty() && std::env::var_os(key).is_none();
+                if missing {
+                    missing_env.push(key.clone());
+                }
+            }
+        }
+        let command_found = !url.trim().is_empty() || command_exists(&command);
+        let mut warnings = Vec::new();
+        if !command_found {
+            warnings.push(format!("Command not found: {}", command));
+        }
+        if !missing_env.is_empty() {
+            warnings.push(format!(
+                "Missing environment variables: {}",
+                missing_env.join(", ")
+            ));
+        }
+        statuses.push(McpServerStatus {
+            id,
+            command,
+            args,
+            url,
+            ok: command_found && missing_env.is_empty(),
+            command_found,
+            missing_env,
+            warnings: warnings.clone(),
+            error: warnings.join("; "),
+        });
+    }
+    let ok = statuses.iter().all(|server| server.ok);
     McpServerTestResult {
-        ok: true,
+        ok,
         tested_at: Utc::now().to_rfc3339(),
-        config_path: settings.mcp_config_path,
-        servers: vec![],
+        config_path,
+        servers: statuses,
     }
 }
 
@@ -2005,6 +3535,8 @@ pub fn run() {
             get_settings,
             save_settings,
             get_api_key,
+            read_image_data_url,
+            read_media_data_url,
             save_api_key,
             choose_directory,
             choose_file,

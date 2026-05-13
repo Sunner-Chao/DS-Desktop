@@ -823,6 +823,301 @@ label {
   white-space: pre-wrap;
 }
 
+.message-image-link {
+  display: block;
+  width: min(720px, 100%);
+  margin-top: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(2, 6, 23, 0.28);
+}
+
+.message-video-link {
+  display: block;
+  width: min(720px, 100%);
+  margin-top: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(2, 6, 23, 0.28);
+}
+
+.message-image {
+  display: block;
+  width: 100%;
+  max-height: 520px;
+  object-fit: contain;
+}
+
+.message-video {
+  display: block;
+  width: 100%;
+  max-height: 520px;
+  background: #020617;
+}
+
+.message-image-fallback {
+  display: block;
+  padding: 10px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.assistant-result-card {
+  display: grid;
+  gap: 11px;
+  min-width: min(620px, 100%);
+}
+
+.assistant-result-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.assistant-result-header strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assistant-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(34, 197, 94, 0.24);
+  color: #86efac;
+  background: rgba(22, 101, 52, 0.18);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.assistant-status.failed {
+  border-color: rgba(248, 113, 113, 0.28);
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.20);
+}
+
+.assistant-result-text {
+  margin: 0;
+  padding: 10px 11px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  background: rgba(15, 23, 42, 0.22);
+}
+
+.assistant-section {
+  display: grid;
+  gap: 6px;
+}
+
+.assistant-section-title {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.assistant-path-list {
+  display: grid;
+  gap: 6px;
+}
+
+.assistant-path-list code {
+  display: block;
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid rgba(6, 182, 212, 0.16);
+  color: rgba(224, 242, 254, 0.90);
+  background: rgba(8, 47, 73, 0.22);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.message-tool-trace {
+  width: min(720px, 100%);
+  margin-top: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.24);
+  overflow: hidden;
+}
+
+.message-tool-trace summary {
+  cursor: pointer;
+  padding: 9px 10px;
+  color: var(--color-text);
+  font-size: 12px;
+  font-weight: 700;
+  user-select: none;
+}
+
+.tool-timeline {
+  display: grid;
+  gap: 0;
+  max-height: 320px;
+  margin: 0;
+  padding: 8px 10px 10px;
+  overflow: auto;
+  border-top: 1px solid rgba(148, 163, 184, 0.14);
+  list-style: none;
+}
+
+.tool-timeline.compact {
+  max-height: 360px;
+  padding: 8px;
+  border-top: 0;
+  border-radius: 7px;
+  background: rgba(2, 6, 23, 0.30);
+}
+
+.tool-event {
+  display: grid;
+  grid-template-columns: 12px 48px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.tool-event:last-child {
+  border-bottom: 0;
+}
+
+.tool-event-dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 999px;
+  background: #38bdf8;
+  box-shadow: 0 0 0 4px rgba(56, 189, 248, 0.10);
+}
+
+.tool-event b {
+  color: var(--color-text);
+  font-size: 11px;
+}
+
+.tool-event span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.tool-event.plan .tool-event-dot {
+  background: #a78bfa;
+  box-shadow: 0 0 0 4px rgba(167, 139, 250, 0.10);
+}
+
+.tool-event.browser .tool-event-dot,
+.tool-event.search .tool-event-dot {
+  background: #22d3ee;
+  box-shadow: 0 0 0 4px rgba(34, 211, 238, 0.10);
+}
+
+.tool-event.file .tool-event-dot,
+.tool-event.done .tool-event-dot {
+  background: #22c55e;
+  box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.10);
+}
+
+.tool-event.error .tool-event-dot {
+  background: #ef4444;
+  box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.12);
+}
+
+.message-bubble.tool-progress-bubble {
+  width: min(760px, 100%);
+  max-width: min(88%, 760px);
+  padding: 0;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--color-surface) 90%, #0891b2 10%);
+  border-color: rgba(45, 212, 191, 0.24);
+}
+
+.tool-progress-card {
+  display: grid;
+  gap: 13px;
+  padding: 14px;
+}
+
+.tool-progress-header {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 11px;
+  align-items: center;
+}
+
+.tool-progress-header strong {
+  display: block;
+  margin-bottom: 3px;
+  font-size: 14px;
+  color: var(--color-text);
+}
+
+.tool-progress-header p {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: normal;
+}
+
+.tool-progress-icon {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 9px;
+  color: #dffafe;
+  background: linear-gradient(135deg, rgba(6, 182, 212, 0.22), rgba(34, 197, 94, 0.14));
+  border: 1px solid rgba(125, 211, 252, 0.20);
+  box-shadow: 0 0 18px rgba(6, 182, 212, 0.16);
+}
+
+.tool-progress-icon.filesystem {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.20), rgba(34, 197, 94, 0.12));
+  color: #fef3c7;
+}
+
+.tool-progress-icon.mcp {
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.20), rgba(20, 184, 166, 0.14));
+}
+
+.tool-progress-preview {
+  display: grid;
+  gap: 6px;
+  min-height: 22px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.tool-progress-preview code {
+  display: block;
+  max-height: 360px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 7px;
+  color: rgba(255, 255, 255, 0.82);
+  background: rgba(2, 6, 23, 0.30);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  .message-bubble.tool-progress-bubble {
+    max-width: 100%;
+  }
+}
+
 .terminal-card {
   display: grid;
   grid-template-rows: auto 300px;

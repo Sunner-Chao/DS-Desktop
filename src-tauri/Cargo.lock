@@ -739,6 +739,7 @@ name = "ds-code"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "base64 0.22.1",
  "chrono",
  "cron",
  "dirs 5.0.1",

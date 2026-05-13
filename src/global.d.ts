@@ -2,10 +2,13 @@ export {};
 
 declare global {
   interface Window {
+    __deepseekDesktopStreamPush?: (sessionId: string, data: string) => void;
     deepseekDesktop: {
 	      getSettings: () => Promise<DesktopSettings>;
 	      saveSettings: (settings: DesktopSettings) => Promise<DesktopSettings>;
 	      getApiKey: (provider?: ProviderMode) => Promise<string>;
+	      readImageDataUrl: (path: string) => Promise<string>;
+	      readMediaDataUrl: (path: string) => Promise<string>;
 	      saveApiKey: (payload: ApiKeySavePayload) => Promise<ApiKeySaveResult>;
 	      getCustomization: (settings: DesktopSettings) => Promise<CustomizationDraft>;
       createSkillTemplate: (payload: SkillCreatePayload) => Promise<TemplateSaveResult>;
@@ -209,6 +212,11 @@ declare global {
     role: "assistant" | "user";
     title?: string;
     content: string;
+    presentation?: "tool-progress";
+    toolKind?: "browser" | "filesystem" | "mcp";
+    imagePath?: string;
+    videoPath?: string;
+    toolTrace?: string;
   }
 
   interface ConversationSession {
