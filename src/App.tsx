@@ -1970,19 +1970,34 @@ function pathLinesFromContent(content: string) {
     .filter((line) => /路径|文件夹|保存|written|saved|[A-Za-z]:\\/.test(line));
 }
 
-type ToolEventKind = "route" | "plan" | "browser" | "search" | "file" | "error" | "done" | "log";
+type ToolEventKind = "route" | "plan" | "browser" | "search" | "file" | "error" | "done" | "log" | "invoke" | "execute" | "thinking";
 
 interface ToolEventItem {
   id: string;
   kind: ToolEventKind;
   label: string;
   detail: string;
+  /** 工具名，invoke 事件专用 */
+  toolName?: string;
 }
 
 function classifyToolEvent(line: string): ToolEventKind {
   const lower = line.toLowerCase();
+
+  // Claude/Codex 风格: bash(...), tool(...), mcp(...) 等函数调用
+  if (/^(bash|tool|mcp|git|node|python|npm|pip|grep|curl|wget|cat|ls|cd|mkdir|rm|cp|mv|echo)\s*\(/i.test(line)) return "invoke";
+  // 通用的函数调用模式: foo(...) or "foo"(...)
+  if (/^[a-z_][a-z0-9_]*\s*\([^)]*\)\s*$/i.test(line)) return "invoke";
+  // MCP invoke 格式: invoking xxx | invoking: xxx
+  if (/^invoking\s/i.test(lower)) return "invoke";
+  // [TOOL] / [invoke] 前缀
+  if (/^\[tool\]|\[invoke\]|\[function\]/i.test(line)) return "invoke";
+  // 执行中状态: executing, running, invoking...
+  if (/^(executing|running|calling|invoking|performing)\s/i.test(lower)) return "execute";
+  // thinking / reasoning 隐藏推理（不展示）
+  if (/^(thinking|thought|reasoning|analyzing)\s/i.test(lower)) return "thinking";
   if (/失败|error|failed|timeout/.test(lower)) return "error";
-  if (/完成|已写入|截图已保存|视频已保存|saved|written/.test(lower)) return "done";
+  if (/完成|已写入|截图已保存|视频已保存|saved|written|done/.test(lower)) return "done";
   if (/mcp 路由|mcp servers|mcp config|cli/.test(lower)) return "route";
   if (/计划|规划|plan|search_query|click_target/.test(lower)) return "plan";
   if (/搜索|search|结果/.test(lower)) return "search";
@@ -2001,24 +2016,39 @@ function labelForToolEvent(kind: ToolEventKind, language: AppLanguage) {
     file: zh ? "文件" : "File",
     error: zh ? "错误" : "Error",
     done: zh ? "完成" : "Done",
+    invoke: zh ? "调用" : "Invoke",
+    execute: zh ? "执行" : "Execute",
+    thinking: zh ? "思考" : "Think",
     log: zh ? "日志" : "Log"
   };
   return labels[kind];
 }
 
 function toolEventsFromTrace(trace: string, language: AppLanguage): ToolEventItem[] {
+  // 提取工具名：invoking xxx, "xxx"(...), foo(...)
+  function extractToolName(line: string): string {
+    const m = line.match(/^invoking\s+(?:(\w+)\s+)?(?:tool\s+)?["']?(\w+)["']?/i)
+      || line.match(/^["']?([a-zA-Z_][a-zA-Z0-9_]*)["']?\s*\(/)
+      || line.match(/^([a-z_][a-z0-9_]*)\s*\(/i);
+    return m ? (m[2] || m[1]) : "tool";
+  }
+
   return stripAnsi(trace)
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean)
+    .filter((line) => !/^(thinking|thought|reasoning|analyzing)\s/i.test(line.toLowerCase()))
     .map((line, index) => {
-      const clean = line.replace(/^\[tool\]\s*/i, "");
+      // 标准化清理，保留原始行用于 invoke 显示
+      const clean = line.replace(/^\[tool\]\s*/i, "").replace(/^\[invoke\]\s*/i, "").replace(/^\[function\]\s*/i, "");
       const kind = classifyToolEvent(clean);
+      const toolName = kind === "invoke" ? extractToolName(clean) : undefined;
       return {
         id: `${index}-${kind}`,
         kind,
         label: labelForToolEvent(kind, language),
-        detail: clean
+        detail: clean,
+        toolName
       };
     });
 }
@@ -2211,13 +2241,32 @@ function MessageVideo({ path, desktop }: { path: string; desktop: Window["deepse
 function ToolTimeline({ events, compact = false }: { events: ToolEventItem[]; compact?: boolean }) {
   return (
     <ol className={compact ? "tool-timeline compact" : "tool-timeline"}>
-      {events.map((event) => (
-        <li key={event.id} className={`tool-event ${event.kind}`}>
-          <span className="tool-event-dot" aria-hidden />
-          <b>{event.label}</b>
-          <span>{event.detail}</span>
-        </li>
-      ))}
+      {events.map((event) => {
+        if (event.kind === "invoke" || event.kind === "execute") {
+          // Claude / Codex 风格: ▶ tool(...) 或 ▶ execute(...)
+          const cmd = event.detail;
+          const parenIdx = cmd.indexOf("(");
+          const fn = parenIdx > -1 ? cmd.slice(0, parenIdx) : cmd;
+          const args = parenIdx > -1 ? cmd.slice(parenIdx) : "()";
+          return (
+            <li key={event.id} className={`tool-event ${event.kind} invoke-style`}>
+              <span className="tool-event-dot" aria-hidden />
+              <b className="invoke-badge">{event.kind === "invoke" ? "▶" : "▶"}</b>
+              <code className="invoke-line">
+                <span className="invoke-fn">{fn}</span>
+                <span className="invoke-args">{args}</span>
+              </code>
+            </li>
+          );
+        }
+        return (
+          <li key={event.id} className={`tool-event ${event.kind}`}>
+            <span className="tool-event-dot" aria-hidden />
+            <b>{event.label}</b>
+            <span>{event.detail}</span>
+          </li>
+        );
+      })}
     </ol>
   );
 }

@@ -1482,6 +1482,19 @@ fn extract_record_seconds(request: &str) -> u64 {
     10
 }
 
+fn find_playwright_node_modules() -> Option<PathBuf> {
+    for candidate in [
+        PathBuf::from("D:\\pro_sunner\\demo_vscode\\node_modules"),
+        std::env::current_dir().ok()?.parent()?.join("node_modules"),
+    ] {
+        let pw = candidate.join("playwright");
+        if pw.exists() || candidate.join("@playwright").exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn npx_command() -> Command {
     for candidate in [
         "C:\\Program Files\\nodejs\\npx.cmd",
@@ -1941,6 +1954,10 @@ fn run_playwright_browser_media(
         0
     };
     let mut command = npx_command();
+    // Inject NODE_PATH so the node script can resolve `playwright` from D:\pro_sunner\demo_vscode\node_modules
+    if let Some(nm) = find_playwright_node_modules() {
+        command.env("NODE_PATH", nm.to_string_lossy().to_string());
+    }
     if !click_target.is_empty() || !plan.search_query.trim().is_empty() {
         emit_terminal_data(
             &app,
@@ -1972,8 +1989,8 @@ fn run_playwright_browser_media(
             Ok(script_path) => command
                 .args([
                     "--yes",
-                    "--package",
-                    "playwright",
+                    "--package=playwright",
+                    "--",
                     "node",
                     &script_path.to_string_lossy().to_string(),
                 ])
@@ -1999,8 +2016,8 @@ fn run_playwright_browser_media(
                 Ok(script_path) => command
                     .args([
                         "--yes",
-                        "--package",
-                        "playwright",
+                        "--package=playwright",
+                        "--",
                         "node",
                         &script_path.to_string_lossy().to_string(),
                     ])
