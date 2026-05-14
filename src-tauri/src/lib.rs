@@ -1,3 +1,5 @@
+mod memory;
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -6,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use base64::{engine::general_purpose, Engine as _};
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use dirs::home_dir;
 use once_cell::sync::Lazy;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
@@ -22,6 +24,8 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 static TERMINAL_SESSIONS: Lazy<Arc<Mutex<HashMap<String, TerminalSession>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 static TERMINAL_RESULTS: Lazy<Arc<Mutex<HashMap<String, TerminalCompletedResult>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+static RUNNING_TASK_PIDS: Lazy<Arc<Mutex<HashMap<String, u32>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,7 +155,7 @@ impl TerminalSession {
     }
 }
 
-fn get_user_data_dir() -> PathBuf {
+pub fn get_user_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("DS_CODE_DATA_DIR") {
         return PathBuf::from(dir);
     }
@@ -2430,6 +2434,7 @@ fn terminal_start(
     let model = settings.model.trim().to_string();
     let provider = settings.provider.trim().to_string();
     let skill_prompt_prefix = build_skill_prompt_prefix(&settings);
+    let memory_injection = memory::read_memory_injection();
     let skills_dir_for_env = if settings.skills_dir.trim().is_empty() {
         get_skills_dir().to_string_lossy().to_string()
     } else {
@@ -2467,16 +2472,16 @@ fn terminal_start(
                 "plan" => format!(
                     "{}\n请只输出实施计划和风险点，不要修改文件或执行破坏性操作。\n\n{}",
                     language_instruction,
-                    format!("{}{}", skill_prompt_prefix, options.agent_prompt)
+                    format!("{}{}{}", skill_prompt_prefix, memory_injection, options.agent_prompt)
                 ),
                 "yolo" => format!(
                     "{}\n在当前 workspace 中完成用户请求。可以进行必要的代码修改和验证；遇到高风险或破坏性操作时先说明原因。\n\n{}",
                     language_instruction,
-                    format!("{}{}", skill_prompt_prefix, options.agent_prompt)
+                    format!("{}{}{}", skill_prompt_prefix, memory_injection, options.agent_prompt)
                 ),
                 _ => format!(
-                    "{}\n\n{}{}",
-                    language_instruction, skill_prompt_prefix, options.agent_prompt
+                    "{}\n\n{}{}{}",
+                    language_instruction, skill_prompt_prefix, memory_injection, options.agent_prompt
                 ),
             };
             args.extend(["exec".to_string(), "--auto".to_string(), prompt]);
@@ -3519,6 +3524,691 @@ fn open_workspace_editor(editor: String, workspace_path: String) -> EditorOpenRe
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryResult {
+    pub ok: bool,
+    pub content: String,
+}
+
+// ── Automation types ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationTask {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub prompt: String,
+    #[serde(rename = "workspacePath")]
+    pub workspace_path: String,
+    pub frequency: String,
+    pub minute: i32,
+    pub hour: i32,
+    pub weekday: i32,
+    #[serde(rename = "customSchedule")]
+    pub custom_schedule: String,
+    pub schedule: String,
+    pub rrule: String,
+    pub timezone: String,
+    pub status: String,
+    pub enabled: bool,
+    pub installed: bool,
+    #[serde(rename = "cronPath")]
+    pub cron_path: String,
+    #[serde(rename = "logPath")]
+    pub log_path: String,
+    #[serde(rename = "commandPreview")]
+    pub command_preview: String,
+    #[serde(rename = "runtimePath")]
+    pub runtime_path: String,
+    #[serde(rename = "runnerPath")]
+    pub runner_path: String,
+    #[serde(rename = "runArgs")]
+    pub run_args: Vec<String>,
+    pub provider: String,
+    pub model: String,
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    #[serde(rename = "mcpConfigPath")]
+    pub mcp_config_path: String,
+    #[serde(rename = "skillsDir")]
+    pub skills_dir: String,
+    #[serde(rename = "enabledSkills")]
+    pub enabled_skills: Vec<String>,
+    #[serde(rename = "mcpEnabled")]
+    pub mcp_enabled: bool,
+    #[serde(rename = "enabledMcpServers")]
+    pub enabled_mcp_servers: Vec<String>,
+    #[serde(rename = "allowShell")]
+    pub allow_shell: bool,
+    #[serde(rename = "maxSubagents")]
+    pub max_subagents: i32,
+    pub error: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
+    #[serde(rename = "lastGeneratedAt")]
+    pub last_generated_at: String,
+    #[serde(rename = "lastInstalledAt")]
+    pub last_installed_at: String,
+    #[serde(rename = "lastRunAt")]
+    #[serde(default)]
+    pub last_run_at: String,
+    #[serde(rename = "lastRunResult")]
+    #[serde(default)]
+    pub last_run_result: String,
+    #[serde(rename = "lastRunOutput")]
+    #[serde(default)]
+    pub last_run_output: String,
+    #[serde(rename = "lastRunExitCode")]
+    #[serde(default)]
+    pub last_run_exit_code: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationStore {
+    pub version: i32,
+    pub tasks: Vec<AutomationTask>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationActionResult {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub task: Option<AutomationTask>,
+    pub tasks: Vec<AutomationTask>,
+}
+
+fn get_automations_path() -> PathBuf {
+    get_user_data_dir().join("automations.json")
+}
+
+fn load_automations() -> AutomationStore {
+    let path = get_automations_path();
+    match fs::read_to_string(&path) {
+        Ok(json) => serde_json::from_str(&json).unwrap_or(AutomationStore {
+            version: 1,
+            tasks: vec![],
+        }),
+        Err(_) => AutomationStore {
+            version: 1,
+            tasks: vec![],
+        },
+    }
+}
+
+fn save_automations(store: &AutomationStore) -> Result<(), String> {
+    let path = get_automations_path();
+    let json =
+        serde_json::to_string_pretty(store).map_err(|e| format!("Failed to serialize: {}", e))?;
+    fs::write(&path, json).map_err(|e| format!("Failed to write automations: {}", e))
+}
+
+// ── Automation commands ──
+
+#[tauri::command]
+fn get_automations() -> AutomationStore {
+    load_automations()
+}
+
+#[tauri::command]
+fn save_automation(task: Value) -> AutomationActionResult {
+    let mut store = load_automations();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Accept partial task data (AutomationDraft) and fill in defaults
+    let id = task["id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("automation-{}", std::time::UNIX_EPOCH.elapsed().unwrap().as_millis()));
+
+    // Find existing task to merge with
+    let existing = store.tasks.iter().find(|t| t.id == id);
+
+    let name = task["name"].as_str().unwrap_or("").to_string();
+    let prompt = task["prompt"].as_str().unwrap_or("").to_string();
+    let workspace_path = task["workspacePath"]
+        .as_str()
+        .unwrap_or(&existing.map(|t| t.workspace_path.as_str()).unwrap_or(""))
+        .to_string();
+    let minute = task["minute"].as_i64().unwrap_or(existing.map(|t| t.minute as i64).unwrap_or(0)) as i32;
+    let hour = task["hour"].as_i64().unwrap_or(existing.map(|t| t.hour as i64).unwrap_or(9)) as i32;
+    let frequency = task["frequency"]
+        .as_str()
+        .unwrap_or(&existing.map(|t| t.frequency.as_str()).unwrap_or("daily"))
+        .to_string();
+    let status = task["status"]
+        .as_str()
+        .unwrap_or("PAUSED")
+        .to_string();
+    let enabled = status == "ACTIVE" || task["enabled"].as_bool().unwrap_or(false);
+    let rrule = task["rrule"]
+        .as_str()
+        .unwrap_or(&format!("FREQ=DAILY;BYHOUR={};BYMINUTE={}", hour, minute))
+        .to_string();
+    let schedule = task["schedule"]
+        .as_str()
+        .unwrap_or(&format!("Daily {:02}:{:02}", hour, minute))
+        .to_string();
+    let timezone = task["timezone"]
+        .as_str()
+        .unwrap_or(existing.map(|t| t.timezone.as_str()).unwrap_or("Asia/Shanghai"))
+        .to_string();
+    let custom_schedule = task["customSchedule"]
+        .as_str()
+        .unwrap_or(&format!("{} {} * * *", minute, hour))
+        .to_string();
+    let cron_path = task["cronPath"]
+        .as_str()
+        .unwrap_or(&format!(".deepseek/cron/{}.cron", id))
+        .to_string();
+    let log_path = task["logPath"]
+        .as_str()
+        .unwrap_or(&format!(".deepseek/logs/{}.log", id))
+        .to_string();
+
+    let created_at = existing
+        .map(|t| t.created_at.clone())
+        .unwrap_or_else(|| now.clone());
+
+    let last_installed_at = if enabled {
+        now.clone()
+    } else {
+        existing.map(|t| t.last_installed_at.clone()).unwrap_or_default()
+    };
+
+    let provider = task["provider"]
+        .as_str()
+        .unwrap_or(existing.map(|t| t.provider.as_str()).unwrap_or("deepseek"))
+        .to_string();
+    let model = task["model"]
+        .as_str()
+        .unwrap_or(existing.map(|t| t.model.as_str()).unwrap_or("deepseek-v4-pro"))
+        .to_string();
+    let base_url = task["baseUrl"]
+        .as_str()
+        .unwrap_or(existing.map(|t| t.base_url.as_str()).unwrap_or("https://api.deepseek.com"))
+        .to_string();
+
+    let updated = AutomationTask {
+        id: id.clone(),
+        kind: "cron".to_string(),
+        name: if name.is_empty() { "Scheduled Task".to_string() } else { name },
+        prompt,
+        workspace_path,
+        frequency,
+        minute,
+        hour,
+        weekday: task["weekday"].as_i64().unwrap_or(existing.map(|t| t.weekday as i64).unwrap_or(1)) as i32,
+        custom_schedule,
+        schedule,
+        rrule,
+        timezone,
+        status: if enabled { "ACTIVE".to_string() } else { "PAUSED".to_string() },
+        enabled,
+        installed: enabled,
+        cron_path,
+        log_path,
+        command_preview: format!("deepseek exec --auto '{}'", task["prompt"].as_str().unwrap_or("")),
+        runtime_path: existing.map(|t| t.runtime_path.clone()).unwrap_or_default(),
+        runner_path: existing.map(|t| t.runner_path.clone()).unwrap_or_default(),
+        run_args: existing
+            .map(|t| t.run_args.clone())
+            .unwrap_or_default(),
+        provider,
+        model,
+        base_url,
+        mcp_config_path: task["mcpConfigPath"]
+            .as_str()
+            .unwrap_or(existing.map(|t| t.mcp_config_path.as_str()).unwrap_or(""))
+            .to_string(),
+        skills_dir: task["skillsDir"]
+            .as_str()
+            .unwrap_or(existing.map(|t| t.skills_dir.as_str()).unwrap_or(""))
+            .to_string(),
+        enabled_skills: task["enabledSkills"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_else(|| existing.map(|t| t.enabled_skills.clone()).unwrap_or_default()),
+        mcp_enabled: task["mcpEnabled"]
+            .as_bool()
+            .unwrap_or(existing.map(|t| t.mcp_enabled).unwrap_or(false)),
+        enabled_mcp_servers: task["enabledMcpServers"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_else(|| existing.map(|t| t.enabled_mcp_servers.clone()).unwrap_or_default()),
+        allow_shell: task["allowShell"]
+            .as_bool()
+            .unwrap_or(existing.map(|t| t.allow_shell).unwrap_or(false)),
+        max_subagents: task["maxSubagents"]
+            .as_i64()
+            .unwrap_or(existing.map(|t| t.max_subagents as i64).unwrap_or(10)) as i32,
+        error: None,
+        created_at,
+        updated_at: now.clone(),
+        last_generated_at: now.clone(),
+        last_installed_at,
+        last_run_at: existing
+            .map(|t| t.last_run_at.clone())
+            .unwrap_or_default(),
+        last_run_result: existing
+            .map(|t| t.last_run_result.clone())
+            .unwrap_or_default(),
+        last_run_output: existing
+            .map(|t| t.last_run_output.clone())
+            .unwrap_or_default(),
+        last_run_exit_code: existing
+            .map(|t| t.last_run_exit_code)
+            .unwrap_or(0),
+    };
+
+    if let Some(pos) = store.tasks.iter().position(|t| t.id == id) {
+        store.tasks[pos] = updated.clone();
+    } else {
+        store.tasks.insert(0, updated.clone());
+    }
+
+    match save_automations(&store) {
+        Ok(()) => AutomationActionResult {
+            ok: true,
+            error: None,
+            task: Some(updated),
+            tasks: store.tasks,
+        },
+        Err(e) => AutomationActionResult {
+            ok: false,
+            error: Some(e),
+            task: None,
+            tasks: store.tasks,
+        },
+    }
+}
+
+#[tauri::command]
+fn get_task_log(task_id: String) -> String {
+    let log_path = get_user_data_dir().join("logs").join(format!("task_{}.log", task_id));
+    fs::read_to_string(&log_path).unwrap_or_default()
+}
+
+#[tauri::command]
+fn delete_automation(id: String) -> AutomationActionResult {
+    let mut store = load_automations();
+    store.tasks.retain(|t| t.id != id);
+
+    match save_automations(&store) {
+        Ok(()) => AutomationActionResult {
+            ok: true,
+            error: None,
+            task: None,
+            tasks: store.tasks,
+        },
+        Err(e) => AutomationActionResult {
+            ok: false,
+            error: Some(e),
+            task: None,
+            tasks: store.tasks,
+        },
+    }
+}
+
+#[tauri::command]
+fn stop_automation_task(id: String) -> AutomationActionResult {
+    // Kill the running child process if it exists
+    if let Some(pid) = RUNNING_TASK_PIDS.lock().unwrap().remove(&id) {
+        let pid_str = pid.to_string();
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &pid_str])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+
+    // Update the task status
+    let mut store = load_automations();
+    if let Some(task) = store.tasks.iter_mut().find(|t| t.id == id) {
+        if task.last_run_result == "running" {
+            task.last_run_result = "error".to_string();
+            task.last_run_exit_code = -1;
+            // Append stop notice to existing output
+            let log_path = get_user_data_dir()
+                .join("logs")
+                .join(format!("task_{}.log", id));
+            if let Ok(log_output) = fs::read_to_string(&log_path) {
+                let truncated = if log_output.len() > 8000 {
+                    format!(
+                        "{}...\n[ truncated, total {} chars ]",
+                        &log_output[..8000],
+                        log_output.len()
+                    )
+                } else {
+                    log_output
+                };
+                task.last_run_output = format!(
+                    "{}\n\n[Task was stopped by user]",
+                    truncated
+                );
+            } else if task.last_run_output.is_empty() {
+                task.last_run_output = "[Task was stopped by user]".to_string();
+            } else {
+                task.last_run_output =
+                    format!("{}\n\n[Task was stopped by user]", task.last_run_output);
+            }
+        }
+    }
+
+    match save_automations(&store) {
+        Ok(()) => AutomationActionResult {
+            ok: true,
+            error: None,
+            task: store.tasks.iter().find(|t| t.id == id).cloned(),
+            tasks: store.tasks,
+        },
+        Err(e) => AutomationActionResult {
+            ok: false,
+            error: Some(e),
+            task: None,
+            tasks: store.tasks,
+        },
+    }
+}
+
+// ── Automation scheduler ──
+
+fn start_automation_scheduler() {
+    std::thread::spawn(|| {
+        // Run first check after 10s to let the app initialize
+        std::thread::sleep(std::time::Duration::from_secs(10));
+
+        // Recover orphaned tasks: tasks that were "running" when the app last shut down
+        {
+            let mut store = load_automations();
+            let mut recovered = false;
+            for task in &mut store.tasks {
+                if task.last_run_result == "running" {
+                    task.last_run_result = "error".to_string();
+                    task.last_run_exit_code = -1;
+                    // Try to recover the log file content
+                    let log_path = get_user_data_dir()
+                        .join("logs")
+                        .join(format!("task_{}.log", task.id));
+                    if let Ok(log_output) = fs::read_to_string(&log_path) {
+                        let truncated = if log_output.len() > 8000 {
+                            format!(
+                                "{}...\n[ truncated, total {} chars ]",
+                                &log_output[..8000],
+                                log_output.len()
+                            )
+                        } else {
+                            log_output
+                        };
+                        task.last_run_output = format!(
+                            "[App was restarted while task was running]\n\n{}",
+                            truncated
+                        );
+                    } else {
+                        task.last_run_output =
+                            "[App was restarted while this task was running — output was lost]"
+                                .to_string();
+                    }
+                    recovered = true;
+                }
+            }
+            if recovered {
+                let _ = save_automations(&store);
+            }
+        }
+
+        loop {
+            let now = chrono::Local::now();
+            let current_hour = now.hour() as i32;
+            let current_minute = now.minute() as i32;
+            let now_str = now.format("%Y-%m-%d %H:%M").to_string();
+
+            let store = load_automations();
+            let mut modified = false;
+            let mut new_store = store;
+            new_store.version += 0; // keep same version
+
+            for task in &mut new_store.tasks {
+                if task.status != "ACTIVE" {
+                    continue;
+                }
+                // Check if it's time to run (within the current minute window)
+                if task.hour == current_hour && task.minute == current_minute {
+                    // Don't re-run if already ran in this minute window
+                    if task.last_run_at == now_str {
+                        continue;
+                    }
+                    info!(
+                        "Scheduler: running automation task '{}' ({})",
+                        task.name, task.id
+                    );
+
+                    // Execute the task
+                    let provider = task.provider.clone();
+                    let api_key = get_api_key(provider.clone()).unwrap_or_default();
+                    let model = task.model.clone();
+                    let base_url = task.base_url.trim().trim_end_matches('/').to_string();
+                    let prompt = task.prompt.clone();
+
+                    // Fallback to a valid workspace directory if none specified
+                    let workspace = if task.workspace_path.trim().is_empty() {
+                        dirs::desktop_dir()
+                            .or_else(|| dirs::home_dir())
+                            .unwrap_or_else(|| PathBuf::from("."))
+                    } else {
+                        PathBuf::from(&task.workspace_path)
+                    };
+                    let workspace_str = workspace.to_string_lossy().to_string();
+
+                    let mut args: Vec<String> = Vec::new();
+                    if !provider.is_empty() {
+                        args.push("--provider".to_string());
+                        args.push(provider.clone());
+                    }
+                    if !model.is_empty() {
+                        args.push("--model".to_string());
+                        args.push(model.clone());
+                    }
+                    if !base_url.is_empty() {
+                        args.push("--base-url".to_string());
+                        args.push(base_url.clone());
+                    }
+                    args.push("exec".to_string());
+                    args.push("--auto".to_string());
+                    args.push(prompt);
+
+                    let binary_path = get_bundled_binary_path();
+                    info!(
+                        "Scheduler: binary={} workspace={} args={:?}",
+                        binary_path, workspace_str, args
+                    );
+
+                    // Mark as running immediately (non-blocking)
+                    task.last_run_at = now_str.clone();
+                    task.last_run_result = "running".to_string();
+                    task.last_run_output = String::new();
+                    modified = true;
+
+                    // Create a log file for real-time output viewing
+                    let log_dir = get_user_data_dir().join("logs");
+                    let _ = fs::create_dir_all(&log_dir);
+                    let log_path = log_dir.join(format!("task_{}.log", task.id));
+                    let log_file = match fs::File::create(&log_path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            error!("Scheduler: cannot create log file {:?}: {}", log_path, e);
+                            continue;
+                        }
+                    };
+
+                    // Duplicate file handle for stderr so both streams go to the same file
+                    let stderr_file = match log_file.try_clone() {
+                        Ok(f) => f,
+                        Err(e) => {
+                            error!("Scheduler: cannot clone log file: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Spawn without blocking the scheduler loop
+                    match Command::new(&binary_path)
+                        .args(&args)
+                        .current_dir(&workspace)
+                        .env("DEEPSEEK_API_KEY", &api_key)
+                        .env("DEEPSEEK_BASE_URL", &base_url)
+                        .stdout(Stdio::from(log_file))
+                        .stderr(Stdio::from(stderr_file))
+                        .spawn()
+                    {
+                        Ok(mut child) => {
+                            let task_id = task.id.clone();
+                            let task_name = task.name.clone();
+                            let task_log_path = log_path.clone();
+
+                            // Store PID so the task can be stopped on demand
+                            let pid = child.id();
+                            RUNNING_TASK_PIDS
+                                .lock()
+                                .unwrap()
+                                .insert(task_id.clone(), pid);
+
+                            // Wait for completion in a background thread
+                            std::thread::spawn(move || {
+                                let result = child.wait();
+                                // Remove PID from running tasks
+                                RUNNING_TASK_PIDS
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&task_id);
+                                let mut store = load_automations();
+                                if let Some(t) = store.tasks.iter_mut().find(|t| t.id == task_id)
+                                {
+                                    // Read the log file to capture output
+                                    let log_output = fs::read_to_string(&task_log_path)
+                                        .unwrap_or_default();
+                                    let truncated = if log_output.len() > 8000 {
+                                        format!(
+                                            "{}...\n[ truncated, total {} chars ]",
+                                            &log_output[..8000],
+                                            log_output.len()
+                                        )
+                                    } else {
+                                        log_output
+                                    };
+
+                                    match result {
+                                        Ok(status) => {
+                                            let exit_code = status.code().unwrap_or(-1);
+                                            info!(
+                                                "Scheduler task '{}' completed. exit={} log_bytes={}",
+                                                task_name, exit_code, truncated.len()
+                                            );
+                                            t.last_run_result = if exit_code == 0 {
+                                                "success".to_string()
+                                            } else {
+                                                "failed".to_string()
+                                            };
+                                            t.last_run_exit_code = exit_code;
+                                            t.last_run_output = truncated;
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Scheduler task '{}' wait failed: {}",
+                                                task_name, e
+                                            );
+                                            t.last_run_result = "error".to_string();
+                                            t.last_run_exit_code = -1;
+                                            t.last_run_output = format!(
+                                                "Process wait error: {}\n\n--- log ---\n{}",
+                                                e, truncated
+                                            );
+                                        }
+                                    }
+                                    let _ = save_automations(&store);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            let err_msg = format!(
+                                "{} (binary={}, workspace={})",
+                                e, binary_path, workspace_str
+                            );
+                            error!("Scheduler task '{}' spawn failed: {}", task.name, err_msg);
+                            task.last_run_result = "error".to_string();
+                            task.last_run_exit_code = -1;
+                            task.last_run_output = err_msg;
+                        }
+                    }
+                }
+            }
+
+            if modified {
+                let _ = save_automations(&new_store);
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    });
+}
+
+// ── Memory commands ──
+
+#[tauri::command]
+fn get_memory(file_type: String) -> MemoryResult {
+    let path = match file_type.as_str() {
+        "memory" => memory::memory_path(),
+        "user" => memory::user_path(),
+        _ => {
+            return MemoryResult {
+                ok: false,
+                content: "Invalid file_type. Use 'memory' or 'user'.".to_string(),
+            }
+        }
+    };
+    let content = memory::load_memory(&path);
+    MemoryResult { ok: true, content }
+}
+
+#[tauri::command]
+fn save_memory(file_type: String, content: String) -> MemoryResult {
+    let path = match file_type.as_str() {
+        "memory" => memory::memory_path(),
+        "user" => memory::user_path(),
+        _ => {
+            return MemoryResult {
+                ok: false,
+                content: "Invalid file_type. Use 'memory' or 'user'.".to_string(),
+            }
+        }
+    };
+    match memory::save_memory(&path, &content) {
+        Ok(()) => MemoryResult {
+            ok: true,
+            content: "Saved.".to_string(),
+        },
+        Err(e) => MemoryResult {
+            ok: false,
+            content: e,
+        },
+    }
+}
+
+#[tauri::command]
+fn append_memory_entry(entry: String) -> MemoryResult {
+    match memory::append_memory(&entry) {
+        Ok(()) => MemoryResult {
+            ok: true,
+            content: "Appended.".to_string(),
+        },
+        Err(e) => MemoryResult {
+            ok: false,
+            content: e,
+        },
+    }
+}
+
 fn setup_logging(log_dir: PathBuf) {
     let _ = fs::create_dir_all(&log_dir);
 
@@ -3536,6 +4226,8 @@ fn setup_logging(log_dir: PathBuf) {
 pub fn run() {
     let log_dir = get_log_dir();
     setup_logging(log_dir);
+
+    start_automation_scheduler();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -3577,6 +4269,14 @@ pub fn run() {
             check_runtime,
             get_runtime_snapshot,
             open_workspace_editor,
+            get_automations,
+            save_automation,
+            delete_automation,
+            stop_automation_task,
+            get_memory,
+            save_memory,
+            append_memory_entry,
+            get_task_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

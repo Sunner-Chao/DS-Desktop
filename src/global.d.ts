@@ -19,7 +19,9 @@ declare global {
       saveConversationHistory: (history: ConversationStore) => Promise<ConversationStore>;
       getAutomations: () => Promise<AutomationStore>;
       saveAutomation: (payload: AutomationSavePayload) => Promise<AutomationActionResult>;
+      getTaskLog: (taskId: string) => Promise<string>;
       deleteAutomation: (payload: AutomationIdPayload) => Promise<AutomationActionResult>;
+      stopAutomationTask: (payload: AutomationIdPayload) => Promise<AutomationActionResult>;
       installAutomation: (payload: AutomationRunPayload) => Promise<AutomationActionResult>;
       uninstallAutomation: (payload: AutomationRunPayload) => Promise<AutomationActionResult>;
       chooseDirectory: () => Promise<string>;
@@ -280,6 +282,10 @@ declare global {
     updatedAt: string;
     lastGeneratedAt: string;
     lastInstalledAt: string;
+    lastRunAt: string;
+    lastRunResult: "running" | "success" | "failed" | "error" | "";
+    lastRunOutput: string;
+    lastRunExitCode: number;
   }
 
   interface AutomationStore {

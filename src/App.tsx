@@ -815,7 +815,18 @@ const uiCopy = {
       command: "运行命令",
       lastGenerated: "更新时间",
       lastInstalled: "启用时间",
+      lastRun: "上次运行",
+      lastRunStatus: "运行结果",
+      viewLog: "查看日志",
+      hideLog: "隐藏日志",
+      runSuccess: "成功",
+      runFailed: "失败",
+      runError: "启动失败",
+      runRunning: "运行中",
+      neverRun: "尚未运行",
       saved: "定时任务已保存",
+      stop: "停止",
+      stoppedOk: "任务已停止",
       installedOk: "定时任务已启用",
       uninstalledOk: "定时任务已暂停",
       deletedOk: "定时任务已删除",
@@ -1205,7 +1216,18 @@ const uiCopy = {
       command: "Run command",
       lastGenerated: "Updated",
       lastInstalled: "Activated",
+      lastRun: "Last run",
+      lastRunStatus: "Run result",
+      viewLog: "View log",
+      hideLog: "Hide log",
+      runSuccess: "Success",
+      runFailed: "Failed",
+      runError: "Launch error",
+      runRunning: "Running",
+      neverRun: "Never run",
       saved: "Scheduled task saved",
+      stop: "Stop",
+      stoppedOk: "Task stopped",
       installedOk: "Scheduled task activated",
       uninstalledOk: "Scheduled task paused",
       deletedOk: "Scheduled task deleted",
@@ -1860,7 +1882,8 @@ function defaultScheduledTaskName(prompt: string, language: AppLanguage) {
 
 function stripAnsi(value: string) {
   return value
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "") // OSC: ESC]0;...BEL / ESC\
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")               // CSI/SGR sequences
     .replace(/\r/g, "\n")
     .replace(/\n{4,}/g, "\n\n\n")
     .trim();
@@ -2549,6 +2572,40 @@ function App() {
     };
   }, [desktop]);
 
+  // Poll for task list changes and real-time logs
+  const automationTasksRef = useRef(automationTasks);
+  automationTasksRef.current = automationTasks;
+
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        // Always refresh task list so new triggers are visible immediately
+        const store = await desktop.getAutomations();
+        const fresh = store.tasks || [];
+        setAutomationTasks(fresh);
+        // Fetch live logs for running tasks
+        const running = fresh.filter((t) => t.lastRunResult === "running");
+        for (const task of running) {
+          try {
+            const log = await desktop.getTaskLog(task.id);
+            setAutomationTasks((current) =>
+              current.map((t) =>
+                t.id === task.id && t.lastRunResult === "running"
+                  ? { ...t, lastRunOutput: log }
+                  : t
+              )
+            );
+          } catch {
+            // skip individual task log errors
+          }
+        }
+      } catch {
+        // silently ignore polling errors
+      }
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [desktop]);
+
   useEffect(() => {
     let active = true;
     desktop.getApiKey(settings.provider).then((storedKey) => {
@@ -3074,6 +3131,16 @@ function App() {
       setAutomationBusy(false);
     }
   }, [applyAutomationResult, desktop, settings, t]);
+
+  const stopAutomationTask = useCallback(async (task: AutomationTask) => {
+    setAutomationBusy(true);
+    try {
+      const result = await desktop.stopAutomationTask({ id: task.id });
+      applyAutomationResult(result, t.automations.stoppedOk || "Task stopped");
+    } finally {
+      setAutomationBusy(false);
+    }
+  }, [applyAutomationResult, desktop, t]);
 
   const deleteAutomationTask = useCallback(async (task: AutomationTask) => {
     if (!window.confirm(t.automations.confirmDelete)) {
@@ -4152,6 +4219,36 @@ function App() {
     </section>
   );
 
+  const [expandedTaskLogs, setExpandedTaskLogs] = useState<Record<string, boolean>>({});
+  const logPreRefs = useRef<Map<string, HTMLPreElement>>(new Map());
+
+  // Auto-scroll running task logs to bottom
+  useEffect(() => {
+    for (const task of automationTasks) {
+      if (task.lastRunResult === "running" && task.lastRunOutput) {
+        const el = logPreRefs.current.get(task.id);
+        if (el) {
+          el.scrollTop = el.scrollHeight;
+        }
+      }
+    }
+  }, [automationTasks]);
+
+  const toggleTaskLog = useCallback((taskId: string) => {
+    setExpandedTaskLogs((current) => ({ ...current, [taskId]: !current[taskId] }));
+  }, []);
+
+  const lastRunStatusLabel = (task: AutomationTask) => {
+    if (!task.lastRunAt) return null;
+    switch (task.lastRunResult) {
+      case "running": return { cls: "run-running", label: t.automations.runRunning };
+      case "success": return { cls: "run-success", label: t.automations.runSuccess };
+      case "failed": return { cls: "run-failed", label: t.automations.runFailed };
+      case "error": return { cls: "run-error", label: t.automations.runError };
+      default: return null;
+    }
+  };
+
   const scheduledTasksPage = (
     <section className="tool-editor-page scheduled-task-page">
       <div className="tool-help">
@@ -4279,15 +4376,59 @@ function App() {
                 </>
               ) : null}
             </div>
-            {task.commandPreview && task.error ? (
-              <div className="automation-command">
-                <span>{t.automations.localRunner}</span>
-                <code title={task.commandPreview}>{task.commandPreview}</code>
-              </div>
+            <div className="automation-paths">
+              {task.lastRunAt ? (
+                <>
+                  <span>{t.automations.lastRun}</span>
+                  <code>{formatAutomationTime(task.lastRunAt, language)}</code>
+                  {(() => {
+                    const s = lastRunStatusLabel(task);
+                    return s ? <span className={`run-status-chip ${s.cls}`}>{s.label}</span> : null;
+                  })()}
+                </>
+              ) : (
+                <span className="run-status-chip never-run">{t.automations.neverRun}</span>
+              )}
+            </div>
+            {task.lastRunOutput ? (
+              (() => {
+                const isExpanded = expandedTaskLogs[task.id] ?? task.lastRunResult === "running";
+                return (
+                  <div className="automation-log-section">
+                    <button
+                      type="button"
+                      className="automation-log-toggle"
+                      onClick={() => toggleTaskLog(task.id)}
+                    >
+                      {isExpanded ? t.automations.hideLog : t.automations.viewLog}
+                    </button>
+                    {isExpanded ? (
+                      <pre
+                        className="automation-log-output"
+                        ref={(el) => {
+                          if (el) {
+                            logPreRefs.current.set(task.id, el);
+                            el.scrollTop = el.scrollHeight;
+                          } else {
+                            logPreRefs.current.delete(task.id);
+                          }
+                        }}
+                      >
+                        {task.lastRunOutput}
+                      </pre>
+                    ) : null}
+                  </div>
+                );
+              })()
             ) : null}
             {task.error ? <p className="template-message error">{task.error}</p> : null}
             <div className="automation-actions">
-              {taskStatus === "ACTIVE" ? (
+              {task.lastRunResult === "running" ? (
+                <button type="button" className="primary" onClick={() => stopAutomationTask(task)} disabled={automationBusy}>
+                  <Square size={16} aria-hidden />
+                  {t.automations.stop || "Stop"}
+                </button>
+              ) : taskStatus === "ACTIVE" ? (
                 <button type="button" className="secondary" onClick={() => uninstallAutomationTask(task)} disabled={automationBusy}>
                   <Square size={16} aria-hidden />
                   {t.automations.uninstall}

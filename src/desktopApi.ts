@@ -201,7 +201,11 @@ let previewAutomations: AutomationTask[] = [
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     lastGeneratedAt: new Date().toISOString(),
-    lastInstalledAt: ""
+    lastInstalledAt: "",
+    lastRunAt: "",
+    lastRunResult: "",
+    lastRunOutput: "",
+    lastRunExitCode: 0
   }
 ];
 
@@ -471,6 +475,9 @@ function createPreviewBridge(): Window["deepseekDesktop"] {
       return previewConversationStore;
     },
     getAutomations: async () => ({ version: 1, tasks: previewAutomations }),
+    getTaskLog: async (taskId) => {
+      return `[Preview] Task ${taskId} log output would appear here in the desktop app.`;
+    },
     saveAutomation: async (payload) => {
       const task = payload.task;
       const id = task.id || `automation-${Date.now().toString(36)}`;
@@ -516,7 +523,11 @@ function createPreviewBridge(): Window["deepseekDesktop"] {
         createdAt: existing?.createdAt || now,
         updatedAt: now,
         lastGeneratedAt: now,
-        lastInstalledAt: enabled ? existing?.lastInstalledAt || now : existing?.lastInstalledAt || ""
+        lastInstalledAt: enabled ? existing?.lastInstalledAt || now : existing?.lastInstalledAt || "",
+        lastRunAt: existing?.lastRunAt || "",
+        lastRunResult: existing?.lastRunResult || "",
+        lastRunOutput: existing?.lastRunOutput || "",
+        lastRunExitCode: existing?.lastRunExitCode ?? 0
       };
       previewAutomations = [saved, ...previewAutomations.filter((item) => item.id !== id)];
       return { ok: true, task: saved, tasks: previewAutomations };
@@ -524,6 +535,15 @@ function createPreviewBridge(): Window["deepseekDesktop"] {
     deleteAutomation: async (payload) => {
       previewAutomations = previewAutomations.filter((item) => item.id !== payload.id);
       return { ok: true, tasks: previewAutomations };
+    },
+    stopAutomationTask: async (payload) => {
+      const now = new Date().toISOString();
+      previewAutomations = previewAutomations.map((item) =>
+        item.id === payload.id
+          ? { ...item, status: "PAUSED", enabled: false, lastRunResult: "error", lastRunOutput: (item.lastRunOutput || "") + "\n\n[Task was stopped by user]", updatedAt: now }
+          : item
+      );
+      return { ok: true, task: previewAutomations.find((item) => item.id === payload.id), tasks: previewAutomations };
     },
     installAutomation: async (payload) => {
       const now = new Date().toISOString();
@@ -752,10 +772,12 @@ function createTauriBridge(): Window["deepseekDesktop"] {
     getConversationHistory: () => invoke<ConversationStore>("get_conversation_history"),
     saveConversationHistory: (history) => invoke<void>("save_conversation_history", { history }),
     getAutomations: () => invoke<AutomationStore>("get_automations"),
+    getTaskLog: (taskId) => invoke<string>("get_task_log", { taskId }),
     saveAutomation: (payload) => invoke<AutomationActionResult>("save_automation", { task: payload.task }),
     deleteAutomation: (payload) => invoke<AutomationActionResult>("delete_automation", { id: payload.id }),
-    installAutomation: (payload) => invoke<AutomationActionResult>("save_automation", { task: { ...payload.task, status: "ACTIVE" } }),
-    uninstallAutomation: (payload) => invoke<AutomationActionResult>("save_automation", { task: { ...payload.task, status: "PAUSED" } }),
+    stopAutomationTask: (payload) => invoke<AutomationActionResult>("stop_automation_task", { id: payload.id }),
+    installAutomation: (payload) => invoke<AutomationActionResult>("save_automation", { task: { id: payload.id, status: "ACTIVE" } }),
+    uninstallAutomation: (payload) => invoke<AutomationActionResult>("save_automation", { task: { id: payload.id, status: "PAUSED" } }),
     chooseDirectory: () => invoke<string>("choose_directory"),
     chooseFile: (filters) => invoke<string>("choose_file", { filters: filters || [] }),
     openWorkspaceEditor: (options) => invoke<OpenWorkspaceEditorResult>("open_workspace_editor", { editor: options.editor, workspacePath: options.workspacePath }),
