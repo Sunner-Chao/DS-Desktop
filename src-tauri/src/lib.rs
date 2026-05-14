@@ -28,6 +28,11 @@ static TERMINAL_RESULTS: Lazy<Arc<Mutex<HashMap<String, TerminalCompletedResult>
 static RUNNING_TASK_PIDS: Lazy<Arc<Mutex<HashMap<String, u32>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+// Tool call timeout for exploration mode (seconds)
+// When set, try_wait loop kills the process and returns a timeout message
+// so the agent can explore alternative approaches
+const TOOL_TIMEOUT_SECS: u64 = 300; // 5 minutes default
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub language: String,
@@ -630,6 +635,32 @@ pub struct TerminalCompletedResult {
 }
 
 fn get_bundled_binary_path() -> String {
+    // 1. Installed location: Tauri resources preserved path
+    if let Ok(exe) = std::env::current_exe() {
+        let resource_path = exe
+            .parent()
+            .map(|p| {
+                p.join("_up_")
+                    .join("node_modules")
+                    .join("deepseek-tui")
+                    .join("bin")
+                    .join("downloads")
+                    .join("deepseek.exe")
+            });
+        if let Some(ref path) = resource_path {
+            if path.exists() {
+                return path.to_string_lossy().to_string();
+            }
+        }
+        // Also check directly next to exe
+        let sibling = exe.parent().map(|p| p.join("deepseek.exe"));
+        if let Some(ref path) = sibling {
+            if path.exists() {
+                return path.to_string_lossy().to_string();
+            }
+        }
+    }
+    // 2. Dev environment: node_modules/deepseek-tui/bin/downloads
     if let Ok(cargo_manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
         let deepseek_binary = PathBuf::from(cargo_manifest_dir)
             .parent() // src-tauri
@@ -2150,6 +2181,7 @@ fn run_playwright_browser_media(
             }
             Ok(None) => {
                 ticks += 1;
+                let elapsed_secs = (ticks * 750) / 1000;
                 if ticks == 1 {
                     emit_terminal_data(
                         &app,
@@ -2157,10 +2189,26 @@ fn run_playwright_browser_media(
                         "[tool] Chrome 已启动，正在打开页面并等待加载...\r\n".to_string(),
                     );
                 } else if ticks % 4 == 0 {
+                    if elapsed_secs >= TOOL_TIMEOUT_SECS {
+                        let _ = child.kill();
+                        let combined = output_buffer
+                            .lock()
+                            .map(|output| output.clone())
+                            .unwrap_or_default();
+                        return (
+                            format!(
+                                "[超时退出] {}执行超过了{}秒仍未完成。\n已终止进程并放弃当前方法。\n请尝试其他替代方案或简化任务步骤。\n已收集的输出：\n{}",
+                                action_name,
+                                TOOL_TIMEOUT_SECS,
+                                combined
+                            ),
+                            -2,
+                        );
+                    }
                     emit_terminal_data(
                         &app,
                         &session_id,
-                        format!("[tool] 页面仍在加载或{}处理中...\r\n", action_name),
+                        format!("[tool] 页面仍在加载或{}处理中...({}s)\r\n", action_name, elapsed_secs),
                     );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(750));
@@ -2836,10 +2884,8 @@ fn terminal_start(
             sessions.insert(session_id.clone(), TerminalSession::new(writer, killer));
         }
 
-        let exec_app = app.clone();
-        let exec_session_id = session_id.clone();
-        let output_buffer = Arc::new(Mutex::new(String::new()));
-        let reader_output = output_buffer.clone();
+        let exec_output_buffer = Arc::new(Mutex::new(String::new()));
+        let reader_output = exec_output_buffer.clone();
         let reader_app = app.clone();
         let reader_session_id = session_id.clone();
         std::thread::spawn(move || {
@@ -2864,38 +2910,113 @@ fn terminal_start(
             }
         });
 
+        let exec_app2 = app.clone();
+        let exec_session_id2 = session_id.clone();
+        let exec_output_buffer2 = exec_output_buffer.clone();
         std::thread::spawn(move || {
-            let exit_code = child
-                .wait()
-                .ok()
-                .map(|status| status.exit_code() as i32)
-                .unwrap_or(-1);
-            {
-                let mut sessions = TERMINAL_SESSIONS.lock().unwrap();
-                sessions.remove(&exec_session_id);
+            let mut ticks: u64 = 0;
+            let tick_duration = std::time::Duration::from_millis(500);
+            loop {
+                std::thread::sleep(tick_duration);
+                ticks += 1;
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let exit_code = status.exit_code() as i32;
+                        {
+                            let mut sessions = TERMINAL_SESSIONS.lock().unwrap();
+                            sessions.remove(&exec_session_id2);
+                        }
+                        let output = exec_output_buffer2
+                            .lock()
+                            .map(|o| o.clone())
+                            .unwrap_or_default();
+                        if let Ok(mut results) = TERMINAL_RESULTS.lock() {
+                            results.insert(
+                                exec_session_id2.clone(),
+                                TerminalCompletedResult {
+                                    session_id: exec_session_id2.clone(),
+                                    exit_code,
+                                    final_output: output.clone(),
+                                },
+                            );
+                        }
+                        let _ = exec_app2.emit(
+                            "terminal:exit",
+                            serde_json::json!({
+                                "sessionId": exec_session_id2,
+                                "exitCode": exit_code,
+                                "finalOutput": output,
+                            }),
+                        );
+                        return;
+                    }
+                    Ok(None) => {
+                        let elapsed_secs = ticks as f64 * 0.5;
+                        // Emit progress every 30s so the user knows it's still running
+                        if ticks % 60 == 0 {
+                            emit_terminal_data(
+                                &exec_app2,
+                                &exec_session_id2,
+                                format!(
+                                    "\r\n[agent] 仍在执行中... 已运行 {}s / {}s 超时限制\r\n",
+                                    elapsed_secs as u64,
+                                    TOOL_TIMEOUT_SECS
+                                ),
+                            );
+                        }
+                        if elapsed_secs >= TOOL_TIMEOUT_SECS as f64 {
+                            let _ = child.kill();
+                            let output = exec_output_buffer2
+                                .lock()
+                                .map(|o| o.clone())
+                                .unwrap_or_default();
+                            let timeout_msg = format!(
+                                "\r\n[超时退出] 任务执行超过 {} 秒已自动终止。\n已尝试的步骤输出：\n{}\n\n请尝试简化为更小粒度的子任务，或使用更具体的步骤指导模型完成任务。",
+                                TOOL_TIMEOUT_SECS,
+                                &output[output.len().saturating_sub(8000)..]
+                            );
+                            if let Ok(mut results) = TERMINAL_RESULTS.lock() {
+                                results.insert(
+                                    exec_session_id2.clone(),
+                                    TerminalCompletedResult {
+                                        session_id: exec_session_id2.clone(),
+                                        exit_code: -2,
+                                        final_output: timeout_msg.clone(),
+                                    },
+                                );
+                            }
+                            let _ = exec_app2.emit(
+                                "terminal:data",
+                                serde_json::json!({
+                                    "sessionId": exec_session_id2,
+                                    "data": timeout_msg,
+                                }),
+                            );
+                            let _ = exec_app2.emit(
+                                "terminal:exit",
+                                serde_json::json!({
+                                    "sessionId": exec_session_id2,
+                                    "exitCode": -2,
+                                    "finalOutput": timeout_msg,
+                                }),
+                            );
+                            {
+                                let mut sessions = TERMINAL_SESSIONS.lock().unwrap();
+                                sessions.remove(&exec_session_id2);
+                            }
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = child.kill();
+                        {
+                            let mut sessions = TERMINAL_SESSIONS.lock().unwrap();
+                            sessions.remove(&exec_session_id2);
+                        }
+                        return;
+                    }
+                }
             }
-            let output = output_buffer
-                .lock()
-                .map(|output| output.clone())
-                .unwrap_or_default();
-            if let Ok(mut results) = TERMINAL_RESULTS.lock() {
-                results.insert(
-                    exec_session_id.clone(),
-                    TerminalCompletedResult {
-                        session_id: exec_session_id.clone(),
-                        exit_code,
-                        final_output: output.clone(),
-                    },
-                );
-            }
-            let _ = exec_app.emit(
-                "terminal:exit",
-                serde_json::json!({
-                    "sessionId": exec_session_id,
-                    "exitCode": exit_code,
-                    "finalOutput": output,
-                }),
-            );
         });
 
         return Ok(TerminalStartResult {
