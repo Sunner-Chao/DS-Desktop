@@ -1,4 +1,14 @@
 # DeepSeekCode
++
+
+## 项目事实速览
+
+Tauri/React 桌面 DeepSeek TUI 外壳，含会话、模型、技能/MCP/工作区面板。
+
+**运行与开发**：Node.js、Rust/Tauri；`npm install && npm run dev`，桌面构建 `npm run tauri:build`。
+
+**边界与安全**：模型、第三方 API、支付渠道、桌面自动化、OCR 和外部数据源均受其自身授权、限额和兼容性约束；不要把演示数据或测试通过当作生产 SLA。禁止提交密钥、令牌、个人数据、模型文件和生产日志。许可证以仓库 LICENSE/NOTICE 及第三方组件声明为准。
+
 Base-DeepSeek TUI 
 
 Desktop harness for the DeepSeek TUI coding agent. The app follows a Codex-style layout: a left conversation sidebar, a right conversation surface, and hidden-on-demand drawers for Skills, MCP, workspace, and runtime settings.
